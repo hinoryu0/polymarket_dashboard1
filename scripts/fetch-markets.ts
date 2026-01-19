@@ -154,51 +154,39 @@ function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
     }
   }
 
-  // Build market URL - prefer market-level links over event-level
+  // Build market URL using priority order to avoid 404s
   let url = '';
   let urlSource = 'unknown';
+  const title = gammaMarket.question || 'Untitled Market';
 
-  // Strategy 1: Check for direct URL field
+  // Priority A (best): Use direct link field from Gamma API
   if (gammaMarket.url && typeof gammaMarket.url === 'string' && gammaMarket.url.includes('polymarket.com')) {
     url = gammaMarket.url;
-    urlSource = 'market.url field';
+    urlSource = 'Priority A (API url field)';
+  } else if (gammaMarket.marketUrl && typeof gammaMarket.marketUrl === 'string' && gammaMarket.marketUrl.includes('polymarket.com')) {
+    url = gammaMarket.marketUrl;
+    urlSource = 'Priority A (API marketUrl field)';
+  } else if (gammaMarket.eventUrl && typeof gammaMarket.eventUrl === 'string' && gammaMarket.eventUrl.includes('polymarket.com')) {
+    url = gammaMarket.eventUrl;
+    urlSource = 'Priority A (API eventUrl field)';
+  } else if (gammaMarket.link && typeof gammaMarket.link === 'string' && gammaMarket.link.includes('polymarket.com')) {
+    url = gammaMarket.link;
+    urlSource = 'Priority A (API link field)';
   }
-  // Strategy 2: Use conditionId for market URL (most reliable for market pages)
-  else if (gammaMarket.conditionId && gammaMarket.conditionId.trim()) {
-    url = `https://polymarket.com/market/${gammaMarket.conditionId.trim()}`;
-    urlSource = 'conditionId';
-  }
-  // Strategy 3: Use first clobTokenId if available (alternative market identifier)
-  else if (gammaMarket.clobTokenIds) {
-    try {
-      let tokenIds: string[] = [];
-      if (typeof gammaMarket.clobTokenIds === 'string') {
-        tokenIds = JSON.parse(gammaMarket.clobTokenIds);
-      } else if (Array.isArray(gammaMarket.clobTokenIds)) {
-        tokenIds = gammaMarket.clobTokenIds;
-      }
-      if (tokenIds.length > 0 && tokenIds[0]) {
-        url = `https://polymarket.com/market/${tokenIds[0]}`;
-        urlSource = 'clobTokenIds[0]';
-      }
-    } catch (e) {
-      // Failed to parse, continue to next strategy
-    }
-  }
-  // Strategy 4: Fallback to event slug (less specific, may show event with multiple markets)
-  if (!url && gammaMarket.slug && gammaMarket.slug.trim()) {
+  // Priority B: Use slug (known to work with event pages)
+  else if (gammaMarket.slug && gammaMarket.slug.trim()) {
     url = `https://polymarket.com/event/${gammaMarket.slug.trim()}`;
-    urlSource = 'event slug (fallback)';
+    urlSource = 'Priority B (event slug)';
   }
-  // Strategy 5: Last resort - use base URL to prevent broken links
-  if (!url) {
-    url = 'https://polymarket.com/';
-    urlSource = 'base URL (no identifier found)';
+  // Priority C (fallback, always works): Generate search URL from title
+  else {
+    url = `https://polymarket.com/search?q=${encodeURIComponent(title)}`;
+    urlSource = 'Priority C (search fallback)';
   }
 
   return {
     id: gammaMarket.id,
-    title: gammaMarket.question || 'Untitled Market',
+    title,
     url,
     yes_price: yesPrice,
     volume_usd: volumeUsd,
