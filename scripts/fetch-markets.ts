@@ -154,8 +154,18 @@ function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
   }
 
   // Build market URL
-  const slug = gammaMarket.slug || gammaMarket.id;
-  const url = `https://polymarket.com/event/${slug}`;
+  // Prefer direct market link using ID, fallback to event slug
+  let url = '';
+  if (gammaMarket.slug && gammaMarket.slug.trim()) {
+    // Use event slug if available (most common format)
+    url = `https://polymarket.com/event/${gammaMarket.slug.trim()}`;
+  } else if (gammaMarket.id) {
+    // Fallback to market ID as slug
+    url = `https://polymarket.com/event/${gammaMarket.id}`;
+  } else {
+    // Last resort - use a placeholder that won't break
+    url = 'https://polymarket.com/';
+  }
 
   return {
     id: gammaMarket.id,

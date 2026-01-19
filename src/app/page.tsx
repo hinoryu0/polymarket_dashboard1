@@ -126,14 +126,26 @@ export default function Dashboard() {
                       </div>
                     </div>
                   </div>
-                  <a
-                    href={market.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition-colors whitespace-nowrap"
-                  >
-                    Open
-                  </a>
+                  {market.url && market.url.startsWith('https://polymarket.com/') ? (
+                    <a
+                      href={market.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      Open
+                    </a>
+                  ) : (
+                    <div className="text-center">
+                      <button
+                        disabled
+                        className="bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg cursor-not-allowed whitespace-nowrap"
+                      >
+                        Open
+                      </button>
+                      <p className="text-xs text-gray-500 mt-1">No link</p>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
