@@ -55,12 +55,16 @@ export class SupabaseMarketProvider implements MarketProvider {
 
   /**
    * Normalize database row to Market type
+   * Override URL to use search fallback to prevent 404s
    */
   private normalizeMarket(row: MarketRow): Market {
+    // Always use search URL to prevent 404s on event/market pages
+    const searchUrl = `https://polymarket.com/search?q=${encodeURIComponent(row.title)}`;
+
     return {
       id: row.id,
       title: row.title,
-      url: row.url,
+      url: searchUrl,
       yesPrice: row.yes_price ?? 0,
       volumeUsd: row.volume_usd ?? undefined,
     };
