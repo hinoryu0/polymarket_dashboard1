@@ -22,12 +22,13 @@ export async function GET(request: Request) {
 
     // Get market provider and fetch markets
     const provider = getMarketProvider();
-    const markets = await provider.getMarkets(limit);
+    const { markets, lastUpdatedAt } = await provider.getMarkets(limit);
 
-    // Return markets as JSON
+    // Return markets as JSON with lastUpdatedAt
     return NextResponse.json({
       success: true,
       count: markets.length,
+      lastUpdatedAt,
       markets,
     });
   } catch (error) {

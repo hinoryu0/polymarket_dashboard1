@@ -6,6 +6,7 @@ import { Market } from '@/lib/providers/types';
 type ApiResponse = {
   success: boolean;
   markets: Market[];
+  lastUpdatedAt?: string | null;
   error?: string;
 };
 
@@ -13,6 +14,7 @@ export default function Dashboard() {
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
   const fetchMarkets = async () => {
     setLoading(true);
@@ -27,6 +29,7 @@ export default function Dashboard() {
       }
 
       setMarkets(data.markets);
+      setLastUpdatedAt(data.lastUpdatedAt || null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
       setMarkets([]);
@@ -49,6 +52,27 @@ export default function Dashboard() {
     return `$${volume.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
   };
 
+  const getTimeSinceUpdate = (): { text: string; isStale: boolean } => {
+    if (!lastUpdatedAt) return { text: 'Unknown', isStale: false };
+
+    const now = new Date();
+    const updated = new Date(lastUpdatedAt);
+    const diffMs = now.getTime() - updated.getTime();
+    const diffMinutes = Math.floor(diffMs / 60000);
+
+    const isStale = diffMinutes > 20;
+
+    if (diffMinutes < 1) return { text: 'Just now', isStale: false };
+    if (diffMinutes === 1) return { text: '1 min ago', isStale };
+    if (diffMinutes < 60) return { text: `${diffMinutes} min ago`, isStale };
+
+    const diffHours = Math.floor(diffMinutes / 60);
+    if (diffHours === 1) return { text: '1 hour ago', isStale: true };
+    return { text: `${diffHours} hours ago`, isStale: true };
+  };
+
+  const { text: timeSinceUpdate, isStale } = getTimeSinceUpdate();
+
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
       <div className="max-w-4xl mx-auto">
@@ -57,9 +81,21 @@ export default function Dashboard() {
           <h1 className="text-4xl font-bold text-gray-900 mb-2">
             Polymarket Dashboard
           </h1>
-          <p className="text-gray-600 mb-6">
+          <p className="text-gray-600 mb-2">
             Top movers / Inefficiency scanner
           </p>
+          {lastUpdatedAt && (
+            <div className="mb-4">
+              <p className="text-sm text-gray-500">
+                Last updated: {timeSinceUpdate}
+              </p>
+              {isStale && (
+                <p className="text-xs text-yellow-600 mt-1">
+                  ⚠ Data might be stale — check GitHub Actions sync
+                </p>
+              )}
+            </div>
+          )}
           <button
             onClick={fetchMarkets}
             disabled={loading}

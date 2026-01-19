@@ -10,10 +10,18 @@ export type Market = {
 };
 
 /**
+ * Markets response with metadata
+ */
+export type MarketsResponse = {
+  markets: Market[];
+  lastUpdatedAt: string | null;
+};
+
+/**
  * Data provider interface for fetching markets
  */
 export interface MarketProvider {
-  getMarkets(limit?: number): Promise<Market[]>;
+  getMarkets(limit?: number): Promise<MarketsResponse>;
 }
 
 /**

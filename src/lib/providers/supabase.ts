@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { Market, MarketProvider, MarketRow } from './types';
+import { Market, MarketProvider, MarketRow, MarketsResponse } from './types';
 
 /**
  * Supabase-based market provider
@@ -16,7 +16,7 @@ export class SupabaseMarketProvider implements MarketProvider {
    * Fetch markets from Supabase, ordered by most recently updated
    * Excludes markets with NULL yes_price
    */
-  async getMarkets(limit: number = 10): Promise<Market[]> {
+  async getMarkets(limit: number = 10): Promise<MarketsResponse> {
     try {
       const { data, error } = await this.supabase
         .from('markets')
@@ -31,12 +31,22 @@ export class SupabaseMarketProvider implements MarketProvider {
         throw new Error(`Failed to fetch markets: ${error.message}`);
       }
 
-      if (!data) {
-        return [];
+      if (!data || data.length === 0) {
+        return { markets: [], lastUpdatedAt: null };
       }
 
       // Normalize database rows to Market type
-      return data.map((row: MarketRow) => this.normalizeMarket(row));
+      const markets = data.map((row: MarketRow) => this.normalizeMarket(row));
+
+      // Calculate lastUpdatedAt from the most recent updated_at
+      const lastUpdatedAt = data.reduce((latest: string | null, row: MarketRow) => {
+        if (!latest || row.updated_at > latest) {
+          return row.updated_at;
+        }
+        return latest;
+      }, null);
+
+      return { markets, lastUpdatedAt };
     } catch (error) {
       console.error('Error fetching markets from Supabase:', error);
       throw error;
