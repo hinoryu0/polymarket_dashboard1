@@ -34,6 +34,9 @@ const GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets';
 const FETCH_TIMEOUT = 10000; // 10 seconds
 const MAX_RETRIES = 1;
 
+// Query parameters to fetch only active markets
+const QUERY_PARAMS = '?active=true&closed=false&limit=100';
+
 /**
  * Fetch markets from Gamma API with timeout and retry
  */
@@ -44,7 +47,7 @@ async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
-    const response = await fetch(GAMMA_API_URL, {
+    const response = await fetch(`${GAMMA_API_URL}${QUERY_PARAMS}`, {
       signal: controller.signal,
       headers: {
         'Accept': 'application/json',
@@ -79,15 +82,34 @@ async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> {
 }
 
 /**
+ * Check if a market is currently active and tradeable
+ */
+function isMarketActive(market: GammaMarket): boolean {
+  // Filter out explicitly closed/resolved/archived markets
+  if (market.closed === true || market.active === false) return false;
+  if (market.resolved === true || market.archived === true) return false;
+
+  // Filter out markets that have ended
+  if (market.endDate || market.end_date || market.endDateIso) {
+    const endDate = new Date(market.endDate || market.end_date || market.endDateIso);
+    if (endDate < new Date()) return false;
+  }
+
+  return true;
+}
+
+/**
  * Normalize Gamma API market data to our database format
  */
 function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
   // Extract yes price (first outcome price, usually "Yes")
+  // ONLY store if it's a valid number between 0 and 1
   let yesPrice: number | null = null;
   if (gammaMarket.outcomePrices && gammaMarket.outcomePrices.length > 0) {
     const priceStr = gammaMarket.outcomePrices[0];
     const parsed = parseFloat(priceStr);
-    if (!isNaN(parsed)) {
+    // Validate: must be a number AND between 0 and 1 (inclusive)
+    if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
       yesPrice = parsed;
     }
   }
@@ -149,20 +171,30 @@ async function main() {
 
     // Fetch markets from Gamma API
     const gammaMarkets = await fetchFromGammaAPI();
+    console.log(`Total fetched: ${gammaMarkets.length}`);
 
     if (gammaMarkets.length === 0) {
       console.warn('No markets received from Gamma API');
       return;
     }
 
+    // Filter to keep only active/tradeable markets
+    const activeMarkets = gammaMarkets.filter(isMarketActive);
+    console.log(`Total kept after filtering: ${activeMarkets.length} (filtered out ${gammaMarkets.length - activeMarkets.length} inactive markets)`);
+
+    if (activeMarkets.length === 0) {
+      console.warn('No active markets after filtering');
+      return;
+    }
+
     // Normalize to our format
-    const normalizedMarkets = gammaMarkets.map(normalizeMarket);
+    const normalizedMarkets = activeMarkets.map(normalizeMarket);
 
     // Upsert to Supabase
     await upsertMarketsToSupabase(normalizedMarkets);
+    console.log(`Total upserted: ${normalizedMarkets.length}`);
 
     console.log('=== Data Ingestion Completed Successfully ===');
-    console.log(`Total markets processed: ${normalizedMarkets.length}`);
   } catch (error) {
     console.error('=== Data Ingestion Failed ===');
     console.error(error);

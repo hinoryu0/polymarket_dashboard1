@@ -14,13 +14,16 @@ export class SupabaseMarketProvider implements MarketProvider {
 
   /**
    * Fetch markets from Supabase, ordered by most recently updated
+   * Excludes markets with NULL yes_price
    */
   async getMarkets(limit: number = 10): Promise<Market[]> {
     try {
       const { data, error } = await this.supabase
         .from('markets')
         .select('*')
+        .not('yes_price', 'is', null)
         .order('updated_at', { ascending: false })
+        .order('volume_usd', { ascending: false, nullsFirst: false })
         .limit(limit);
 
       if (error) {
