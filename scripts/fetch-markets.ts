@@ -102,16 +102,46 @@ function isMarketActive(market: GammaMarket): boolean {
  * Normalize Gamma API market data to our database format
  */
 function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
-  // Extract yes price (first outcome price, usually "Yes")
-  // ONLY store if it's a valid number between 0 and 1
+  // Extract yes price
+  // Gamma API returns outcomes and outcomePrices as STRINGIFIED JSON arrays
+  // Example: outcomes = '["Yes", "No"]', outcomePrices = '["0.65", "0.35"]'
   let yesPrice: number | null = null;
-  if (gammaMarket.outcomePrices && gammaMarket.outcomePrices.length > 0) {
-    const priceStr = gammaMarket.outcomePrices[0];
-    const parsed = parseFloat(priceStr);
-    // Validate: must be a number AND between 0 and 1 (inclusive)
-    if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
-      yesPrice = parsed;
+
+  try {
+    // Parse stringified arrays
+    let outcomes: string[] = [];
+    let prices: string[] = [];
+
+    if (typeof gammaMarket.outcomes === 'string') {
+      outcomes = JSON.parse(gammaMarket.outcomes);
+    } else if (Array.isArray(gammaMarket.outcomes)) {
+      outcomes = gammaMarket.outcomes;
     }
+
+    if (typeof gammaMarket.outcomePrices === 'string') {
+      prices = JSON.parse(gammaMarket.outcomePrices);
+    } else if (Array.isArray(gammaMarket.outcomePrices)) {
+      prices = gammaMarket.outcomePrices;
+    }
+
+    // Find the "Yes" outcome (case-insensitive)
+    if (outcomes.length > 0 && prices.length > 0) {
+      const yesIndex = outcomes.findIndex(
+        outcome => outcome.toLowerCase().trim() === 'yes'
+      );
+
+      if (yesIndex !== -1 && yesIndex < prices.length) {
+        const priceStr = prices[yesIndex];
+        const parsed = parseFloat(priceStr);
+        // Validate: must be a number AND between 0 and 1 (inclusive)
+        if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
+          yesPrice = parsed;
+        }
+      }
+    }
+  } catch (error) {
+    // Failed to parse - yesPrice remains null
+    console.warn(`Failed to parse outcomes/prices for market ${gammaMarket.id}:`, error);
   }
 
   // Extract volume
@@ -189,6 +219,21 @@ async function main() {
 
     // Normalize to our format
     const normalizedMarkets = activeMarkets.map(normalizeMarket);
+
+    // Count markets with valid yes_price
+    const marketsWithPrice = normalizedMarkets.filter(m => m.yes_price !== null);
+    console.log(`Markets with valid yes_price: ${marketsWithPrice.length}/${normalizedMarkets.length}`);
+
+    // Show 3 sample markets with extracted prices
+    if (marketsWithPrice.length > 0) {
+      console.log('\nSample markets with extracted prices:');
+      marketsWithPrice.slice(0, 3).forEach((market, idx) => {
+        const pricePercent = ((market.yes_price || 0) * 100).toFixed(1);
+        console.log(`  ${idx + 1}. "${market.title.substring(0, 60)}..." → ${pricePercent}%`);
+      });
+    } else {
+      console.warn('⚠️  WARNING: No markets have valid yes_price! Check API response structure.');
+    }
 
     // Upsert to Supabase
     await upsertMarketsToSupabase(normalizedMarkets);
