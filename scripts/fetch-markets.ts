@@ -27,6 +27,7 @@ type MarketRecord = {
   yes_price: number | null;
   volume_usd: number | null;
   updated_at?: string;
+  _urlSource?: string; // Temporary field for logging
 };
 
 // Configuration
@@ -153,18 +154,46 @@ function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
     }
   }
 
-  // Build market URL
-  // Prefer direct market link using ID, fallback to event slug
+  // Build market URL - prefer market-level links over event-level
   let url = '';
-  if (gammaMarket.slug && gammaMarket.slug.trim()) {
-    // Use event slug if available (most common format)
+  let urlSource = 'unknown';
+
+  // Strategy 1: Check for direct URL field
+  if (gammaMarket.url && typeof gammaMarket.url === 'string' && gammaMarket.url.includes('polymarket.com')) {
+    url = gammaMarket.url;
+    urlSource = 'market.url field';
+  }
+  // Strategy 2: Use conditionId for market URL (most reliable for market pages)
+  else if (gammaMarket.conditionId && gammaMarket.conditionId.trim()) {
+    url = `https://polymarket.com/market/${gammaMarket.conditionId.trim()}`;
+    urlSource = 'conditionId';
+  }
+  // Strategy 3: Use first clobTokenId if available (alternative market identifier)
+  else if (gammaMarket.clobTokenIds) {
+    try {
+      let tokenIds: string[] = [];
+      if (typeof gammaMarket.clobTokenIds === 'string') {
+        tokenIds = JSON.parse(gammaMarket.clobTokenIds);
+      } else if (Array.isArray(gammaMarket.clobTokenIds)) {
+        tokenIds = gammaMarket.clobTokenIds;
+      }
+      if (tokenIds.length > 0 && tokenIds[0]) {
+        url = `https://polymarket.com/market/${tokenIds[0]}`;
+        urlSource = 'clobTokenIds[0]';
+      }
+    } catch (e) {
+      // Failed to parse, continue to next strategy
+    }
+  }
+  // Strategy 4: Fallback to event slug (less specific, may show event with multiple markets)
+  if (!url && gammaMarket.slug && gammaMarket.slug.trim()) {
     url = `https://polymarket.com/event/${gammaMarket.slug.trim()}`;
-  } else if (gammaMarket.id) {
-    // Fallback to market ID as slug
-    url = `https://polymarket.com/event/${gammaMarket.id}`;
-  } else {
-    // Last resort - use a placeholder that won't break
+    urlSource = 'event slug (fallback)';
+  }
+  // Strategy 5: Last resort - use base URL to prevent broken links
+  if (!url) {
     url = 'https://polymarket.com/';
+    urlSource = 'base URL (no identifier found)';
   }
 
   return {
@@ -173,6 +202,7 @@ function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
     url,
     yes_price: yesPrice,
     volume_usd: volumeUsd,
+    _urlSource: urlSource, // Temporary field for logging
   };
 }
 
@@ -245,8 +275,18 @@ async function main() {
       console.warn('⚠️  WARNING: No markets have valid yes_price! Check API response structure.');
     }
 
+    // Show 3 sample URLs with their sources (for debugging)
+    console.log('\nSample URLs with sources:');
+    normalizedMarkets.slice(0, 3).forEach((market, idx) => {
+      const titleShort = market.title.substring(0, 50);
+      console.log(`  ${idx + 1}. "${titleShort}..." → ${market.url} (source: ${market._urlSource || 'unknown'})`);
+    });
+
+    // Remove temporary _urlSource field before upserting to Supabase
+    const marketsForDb = normalizedMarkets.map(({ _urlSource, ...market }) => market);
+
     // Upsert to Supabase
-    await upsertMarketsToSupabase(normalizedMarkets);
+    await upsertMarketsToSupabase(marketsForDb);
     console.log(`Total upserted: ${normalizedMarkets.length}`);
 
     console.log('=== Data Ingestion Completed Successfully ===');
