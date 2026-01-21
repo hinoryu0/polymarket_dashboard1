@@ -41,7 +41,7 @@ const QUERY_PARAMS = '?active=true&closed=false&limit=100';
 /**
  * Fetch markets from Gamma API with timeout and retry
  */
-async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> {
+export async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> {
   try {
     console.log(`Fetching markets from Gamma API (attempt ${retryCount + 1})...`);
 
@@ -85,7 +85,7 @@ async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> {
 /**
  * Check if a market is currently active and tradeable
  */
-function isMarketActive(market: GammaMarket): boolean {
+export function isMarketActive(market: GammaMarket): boolean {
   // Filter out explicitly closed/resolved/archived markets
   if (market.closed === true || market.active === false) return false;
   if (market.resolved === true || market.archived === true) return false;
@@ -102,7 +102,7 @@ function isMarketActive(market: GammaMarket): boolean {
 /**
  * Normalize Gamma API market data to our database format
  */
-function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
+export function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
   // Extract yes price
   // Gamma API returns outcomes and outcomePrices as STRINGIFIED JSON arrays
   // Example: outcomes = '["Yes", "No"]', outcomePrices = '["0.65", "0.35"]'
@@ -197,7 +197,7 @@ function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
 /**
  * Upsert markets into Supabase
  */
-async function upsertMarketsToSupabase(markets: MarketRecord[]): Promise<void> {
+export async function upsertMarketsToSupabase(markets: MarketRecord[]): Promise<void> {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
@@ -224,7 +224,7 @@ async function upsertMarketsToSupabase(markets: MarketRecord[]): Promise<void> {
  * Insert price snapshots into Supabase
  * Only inserts snapshots for markets with valid yes_price
  */
-async function insertPriceSnapshots(markets: MarketRecord[]): Promise<number> {
+export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<number> {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
