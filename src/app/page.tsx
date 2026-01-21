@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { Market } from '@/lib/providers/types';
+import MoversSection from '@/components/MoversSection';
 
 type ApiResponse = {
   success: boolean;
@@ -136,10 +137,14 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* Markets List */}
+        {/* Top Volume Markets */}
         {!loading && !error && markets.length > 0 && (
-          <div className="space-y-4">
-            {markets.map((market) => (
+          <div className="mb-8">
+            <h2 className="text-2xl font-bold text-gray-900 mb-4">
+              Top Volume Markets
+            </h2>
+            <div className="space-y-4">
+              {markets.map((market) => (
               <div
                 key={market.id}
                 className="bg-white border border-gray-200 rounded-lg p-6 hover:shadow-lg transition-shadow"
@@ -185,8 +190,12 @@ export default function Dashboard() {
                 </div>
               </div>
             ))}
+            </div>
           </div>
         )}
+
+        {/* Price Movers Section */}
+        <MoversSection />
       </div>
     </div>
   );
