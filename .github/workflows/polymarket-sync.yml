@@ -8,11 +8,22 @@ on:
   # Allow manual trigger
   workflow_dispatch:
 
+# Prevent concurrent runs but don't cancel scheduled jobs
+concurrency:
+  group: polymarket-sync
+  cancel-in-progress: false
+
 jobs:
   sync-markets:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Log sync start
+        run: |
+          echo "=== Polymarket Data Sync START === $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "Workflow run: ${{ github.run_number }}"
+          echo "Triggered by: ${{ github.event_name }}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -31,12 +42,13 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: npm run fetch-markets
 
-      - name: Report status
+      - name: Log sync end
         if: always()
         run: |
-          if [ $? -eq 0 ]; then
+          echo "=== Polymarket Data Sync END === $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          if [ ${{ job.status }} == 'success' ]; then
             echo "✅ Market data sync completed successfully"
           else
             echo "❌ Market data sync failed"
-            exit 1
           fi
+
