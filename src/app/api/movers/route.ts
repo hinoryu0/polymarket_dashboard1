@@ -9,10 +9,19 @@ const WINDOW_HOURS: Record<WindowType, number> = {
   '24h': 24,
 };
 
+// Tolerance ranges for each window (in minutes)
+const WINDOW_TOLERANCE: Record<WindowType, { min: number; max: number }> = {
+  '1h': { min: 45, max: 75 },   // 45-75 minutes ago
+  '6h': { min: 300, max: 420 }, // 5-7 hours ago
+  '24h': { min: 1320, max: 1560 }, // 22-26 hours ago
+};
+
 type SnapshotData = {
   market_id: string;
   latest_price: number | null;
+  latest_time: string | null;
   past_price: number | null;
+  past_time: string | null;
   title: string;
   slug: string | null;
   volume_usd: number | null;
@@ -27,6 +36,9 @@ type MoverData = {
   past_price: number;
   change_abs: number;
   change_pct: number;
+  latest_time: string;  // Debug field
+  past_time: string;    // Debug field
+  age_minutes: number;  // Debug field
 };
 
 /**
@@ -96,22 +108,33 @@ export async function GET(request: Request) {
       throw new Error(`Failed to fetch past snapshots: ${pastError.message}`);
     }
 
-    // Process snapshots to get latest and past prices per market
-    const marketData = new Map<string, { latest: number | null; past: number | null }>();
+    // Process snapshots to get latest and past prices per market WITH timestamps
+    const marketData = new Map<string, {
+      latest: number | null;
+      latest_time: string | null;
+      past: number | null;
+      past_time: string | null;
+    }>();
 
-    // Get latest price per market (first occurrence in desc order)
-    const latestByMarket = new Map<string, number>();
+    // Get latest price and timestamp per market (first occurrence in desc order)
+    const latestByMarket = new Map<string, { price: number; time: string }>();
     latestSnapshots?.forEach((snap) => {
       if (!latestByMarket.has(snap.market_id) && snap.yes_price !== null) {
-        latestByMarket.set(snap.market_id, snap.yes_price);
+        latestByMarket.set(snap.market_id, {
+          price: snap.yes_price,
+          time: snap.created_at
+        });
       }
     });
 
-    // Get past price per market (first occurrence in desc order <= target time)
-    const pastByMarket = new Map<string, number>();
+    // Get past price and timestamp per market (first occurrence in desc order <= target time)
+    const pastByMarket = new Map<string, { price: number; time: string }>();
     pastSnapshots?.forEach((snap) => {
       if (!pastByMarket.has(snap.market_id) && snap.yes_price !== null) {
-        pastByMarket.set(snap.market_id, snap.yes_price);
+        pastByMarket.set(snap.market_id, {
+          price: snap.yes_price,
+          time: snap.created_at
+        });
       }
     });
 
@@ -121,9 +144,14 @@ export async function GET(request: Request) {
       ...Array.from(pastByMarket.keys())
     ]);
     allMarketIds.forEach((marketId) => {
+      const latest = latestByMarket.get(marketId);
+      const past = pastByMarket.get(marketId);
+
       marketData.set(marketId, {
-        latest: latestByMarket.get(marketId) || null,
-        past: pastByMarket.get(marketId) || null,
+        latest: latest?.price || null,
+        latest_time: latest?.time || null,
+        past: past?.price || null,
+        past_time: past?.time || null,
       });
     });
 
@@ -138,17 +166,29 @@ export async function GET(request: Request) {
       throw new Error(`Failed to fetch market metadata: ${marketsError.message}`);
     }
 
-    // Step 4: Compute movers
+    // Step 4: Compute movers with tolerance checking
     const movers: MoverData[] = [];
+    const tolerance = WINDOW_TOLERANCE[window];
 
     markets?.forEach((market) => {
       const priceData = marketData.get(market.id);
       if (!priceData) return;
 
-      const { latest, past } = priceData;
+      const { latest, latest_time, past, past_time } = priceData;
 
-      // Skip if missing prices or past_price is 0/null
+      // Skip if missing prices, timestamps, or past_price is 0/null
       if (latest === null || past === null || past === 0) return;
+      if (!latest_time || !past_time) return;
+
+      // Calculate age in minutes between snapshots
+      const latestDate = new Date(latest_time);
+      const pastDate = new Date(past_time);
+      const age_minutes = Math.round((latestDate.getTime() - pastDate.getTime()) / 60000);
+
+      // TOLERANCE CHECK: Skip if age is outside the acceptable range for this window
+      if (age_minutes < tolerance.min || age_minutes > tolerance.max) {
+        return; // Skip this market - data is too old or too recent
+      }
 
       const change_abs = latest - past;
       const change_pct = (change_abs / past) * 100;
@@ -169,6 +209,9 @@ export async function GET(request: Request) {
         past_price: past,
         change_abs,
         change_pct,
+        latest_time,  // Debug field
+        past_time,    // Debug field
+        age_minutes,  // Debug field
       });
     });
 
