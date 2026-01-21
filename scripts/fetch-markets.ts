@@ -221,6 +221,59 @@ async function upsertMarketsToSupabase(markets: MarketRecord[]): Promise<void> {
 }
 
 /**
+ * Insert price snapshots into Supabase
+ * Only inserts snapshots for markets with valid yes_price
+ */
+async function insertPriceSnapshots(markets: MarketRecord[]): Promise<number> {
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error('Missing Supabase configuration. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  // Filter markets to only those with valid yes_price
+  const snapshotsToInsert = markets
+    .filter(market => {
+      // Only include if market_id exists and yes_price is a valid number
+      return (
+        market.id &&
+        market.id.trim() !== '' &&
+        market.yes_price !== null &&
+        market.yes_price !== undefined &&
+        typeof market.yes_price === 'number' &&
+        !isNaN(market.yes_price)
+      );
+    })
+    .map(market => ({
+      market_id: market.id,
+      yes_price: market.yes_price,
+      volume_usd: market.volume_usd,
+      // created_at will default to now() in database
+    }));
+
+  if (snapshotsToInsert.length === 0) {
+    console.log('No valid snapshots to insert (no markets with valid yes_price)');
+    return 0;
+  }
+
+  console.log(`Inserting ${snapshotsToInsert.length} price snapshots...`);
+
+  const { data, error } = await supabase
+    .from('price_snapshots')
+    .insert(snapshotsToInsert);
+
+  if (error) {
+    throw new Error(`Snapshot insertion error: ${error.message}`);
+  }
+
+  console.log(`Successfully inserted ${snapshotsToInsert.length} price snapshots`);
+  return snapshotsToInsert.length;
+}
+
+/**
  * Main execution function
  */
 async function main() {
@@ -275,7 +328,11 @@ async function main() {
 
     // Upsert to Supabase
     await upsertMarketsToSupabase(marketsForDb);
-    console.log(`Total upserted: ${normalizedMarkets.length}`);
+    console.log(`Markets upserted: ${marketsForDb.length}`);
+
+    // Insert price snapshots (V1 Step 1: Historical price tracking)
+    const snapshotsInserted = await insertPriceSnapshots(marketsForDb);
+    console.log(`Snapshots inserted: ${snapshotsInserted}`);
 
     console.log('=== Data Ingestion Completed Successfully ===');
   } catch (error) {
