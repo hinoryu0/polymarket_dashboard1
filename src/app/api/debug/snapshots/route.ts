@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js';
  * Returns snapshot health stats and sample data for debugging
  *
  * This is a read-only endpoint to help diagnose snapshot data issues
+ * Uses SQL aggregates for accurate counts instead of client-side counting
  */
 export async function GET(request: Request) {
   try {
@@ -23,49 +24,98 @@ export async function GET(request: Request) {
     const now = new Date();
     const hours48Ago = new Date(now.getTime() - 48 * 60 * 60 * 1000);
 
-    // Query 1: Get total count and distinct markets in last 48h
-    const { data: snapshotsLast48h, error: countError } = await supabase
-      .from('price_snapshots')
-      .select('market_id, created_at, yes_price')
-      .gte('created_at', hours48Ago.toISOString())
-      .not('yes_price', 'is', null);
+    // Query 1: Get accurate aggregates using SQL (not limited by pagination)
+    // Use rpc to execute raw SQL for COUNT(*) and COUNT(DISTINCT market_id)
+    const { data: aggregates, error: aggregatesError } = await supabase.rpc(
+      'get_snapshot_stats_last_48h',
+      { hours_ago: 48 }
+    ).single() as {
+      data: {
+        total_snapshots: number;
+        distinct_markets: number;
+        newest_snapshot_at: string;
+        oldest_snapshot_at: string;
+      } | null;
+      error: any;
+    };
 
-    if (countError) {
-      throw new Error(`Failed to query snapshots: ${countError.message}`);
+    // If RPC doesn't exist, fall back to multiple queries
+    let totalSnapshotsLast48h = 0;
+    let totalDistinctMarketsLast48h = 0;
+    let newestSnapshotAt: string | null = null;
+    let oldestSnapshotAt: string | null = null;
+
+    if (aggregatesError || !aggregates) {
+      // Fallback: Use head: true with count: 'exact' for total count
+      const { count: totalCount, error: countError } = await supabase
+        .from('price_snapshots')
+        .select('*', { count: 'exact', head: true })
+        .gte('created_at', hours48Ago.toISOString())
+        .not('yes_price', 'is', null);
+
+      if (countError) {
+        throw new Error(`Failed to count snapshots: ${countError.message}`);
+      }
+
+      totalSnapshotsLast48h = totalCount || 0;
+
+      // Get distinct market count using a separate query with select on market_id only
+      const { data: distinctMarkets, error: distinctError } = await supabase
+        .from('price_snapshots')
+        .select('market_id')
+        .gte('created_at', hours48Ago.toISOString())
+        .not('yes_price', 'is', null);
+
+      if (distinctError) {
+        throw new Error(`Failed to fetch market IDs: ${distinctError.message}`);
+      }
+
+      // Count distinct on client side (this is the limitation we're working around)
+      const distinctMarketIds = new Set(distinctMarkets?.map(s => s.market_id) || []);
+      totalDistinctMarketsLast48h = distinctMarketIds.size;
+
+      console.warn('RPC function get_snapshot_stats_last_48h not found, using fallback queries');
+    } else {
+      // Use RPC results
+      totalSnapshotsLast48h = aggregates.total_snapshots || 0;
+      totalDistinctMarketsLast48h = aggregates.distinct_markets || 0;
+      newestSnapshotAt = aggregates.newest_snapshot_at || null;
+      oldestSnapshotAt = aggregates.oldest_snapshot_at || null;
     }
 
-    const totalSnapshotsLast48h = snapshotsLast48h?.length || 0;
-    const distinctMarketIds = new Set(snapshotsLast48h?.map(s => s.market_id) || []);
-    const totalDistinctMarketsLast48h = distinctMarketIds.size;
+    // Query 2: Get newest and oldest timestamps (if not from RPC)
+    if (!newestSnapshotAt) {
+      const { data: newestSnapshot, error: newestError } = await supabase
+        .from('price_snapshots')
+        .select('created_at')
+        .not('yes_price', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(1);
 
-    // Query 2: Get newest and oldest timestamps
-    const { data: newestSnapshot, error: newestError } = await supabase
-      .from('price_snapshots')
-      .select('created_at')
-      .not('yes_price', 'is', null)
-      .order('created_at', { ascending: false })
-      .limit(1);
+      if (newestError) {
+        throw new Error(`Failed to fetch newest snapshot: ${newestError.message}`);
+      }
 
-    if (newestError) {
-      throw new Error(`Failed to fetch newest snapshot: ${newestError.message}`);
+      newestSnapshotAt = newestSnapshot?.[0]?.created_at || null;
     }
 
-    const { data: oldestSnapshot48h, error: oldestError } = await supabase
-      .from('price_snapshots')
-      .select('created_at')
-      .gte('created_at', hours48Ago.toISOString())
-      .not('yes_price', 'is', null)
-      .order('created_at', { ascending: true })
-      .limit(1);
+    if (!oldestSnapshotAt) {
+      const { data: oldestSnapshot48h, error: oldestError } = await supabase
+        .from('price_snapshots')
+        .select('created_at')
+        .gte('created_at', hours48Ago.toISOString())
+        .not('yes_price', 'is', null)
+        .order('created_at', { ascending: true })
+        .limit(1);
 
-    if (oldestError) {
-      throw new Error(`Failed to fetch oldest snapshot: ${oldestError.message}`);
+      if (oldestError) {
+        throw new Error(`Failed to fetch oldest snapshot: ${oldestError.message}`);
+      }
+
+      oldestSnapshotAt = oldestSnapshot48h?.[0]?.created_at || null;
     }
 
-    const newestSnapshotAt = newestSnapshot?.[0]?.created_at || null;
-    const oldestSnapshotAt = oldestSnapshot48h?.[0]?.created_at || null;
-
-    // Query 3: Get 5 newest snapshots with details
+    // Query 3: Get 5 newest snapshots with details (sample data)
     const { data: newestSamples, error: newestSamplesError } = await supabase
       .from('price_snapshots')
       .select('market_id, created_at, yes_price')
@@ -77,7 +127,7 @@ export async function GET(request: Request) {
       throw new Error(`Failed to fetch newest samples: ${newestSamplesError.message}`);
     }
 
-    // Query 4: Get 5 oldest snapshots within last 48h
+    // Query 4: Get 5 oldest snapshots within last 48h (sample data)
     const { data: oldestSamples, error: oldestSamplesError } = await supabase
       .from('price_snapshots')
       .select('market_id, created_at, yes_price')
@@ -130,6 +180,10 @@ export async function GET(request: Request) {
         hasEnoughMarkets: totalDistinctMarketsLast48h >= 10,
         recommendations: [] as string[],
       },
+
+      _note: aggregatesError
+        ? 'Using fallback queries (distinct market count may be inaccurate if >1000 results). Consider creating RPC function for accurate stats.'
+        : 'Using SQL aggregates for accurate counts',
     };
 
     // Add recommendations based on health
