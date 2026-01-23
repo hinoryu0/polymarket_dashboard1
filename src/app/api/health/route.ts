@@ -1,5 +1,22 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import { readFile } from 'fs/promises';
+import { join } from 'path';
+import type { IngestionResult } from '@/lib/ingestion/types';
+
+/**
+ * Load last ingestion stats from file
+ */
+async function loadLastIngestionStats(): Promise<IngestionResult | null> {
+  try {
+    const filePath = join(process.cwd(), '.last-ingestion.json');
+    const content = await readFile(filePath, 'utf-8');
+    return JSON.parse(content) as IngestionResult;
+  } catch (error) {
+    // File doesn't exist or is invalid - that's ok
+    return null;
+  }
+}
 
 /**
  * GET /api/health
@@ -56,12 +73,22 @@ export async function GET() {
 
     const lastMarketUpdatedAt = latestMarket?.updated_at || null;
 
+    // Load last ingestion stats
+    const lastIngestion = await loadLastIngestionStats();
+
     return NextResponse.json({
       ok: true,
       timestamp: new Date().toISOString(),
       marketsTotal: marketsTotal ?? 0,
       marketsWithPrice: marketsWithPrice ?? 0,
       lastMarketUpdatedAt,
+      // Stats from last ingestion run
+      fetchedMarketsTotal: lastIngestion?.fetchedMarketsTotal ?? null,
+      keptMarketsTotal: lastIngestion?.keptMarketsTotal ?? null,
+      filteredInactiveCount: lastIngestion?.filteredInactiveCount ?? null,
+      filteredSportsCount: lastIngestion?.filteredSportsCount ?? null,
+      snapshotsInserted: lastIngestion?.snapshotsInserted ?? null,
+      lastSnapshotCreatedAt: lastIngestion?.lastSnapshotCreatedAt ?? null,
     });
   } catch (error) {
     console.error('Error in /api/health:', error);
