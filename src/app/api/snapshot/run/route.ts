@@ -1,11 +1,5 @@
 import { NextResponse } from 'next/server';
-import {
-  fetchFromGammaAPI,
-  isMarketActive,
-  normalizeMarket,
-  upsertMarketsToSupabase,
-  insertPriceSnapshots,
-} from '../../../../scripts/fetch-markets';
+import { runIngestion } from '@/lib/ingestion/runIngestion';
 
 /**
  * Verify authentication via header or query parameter
@@ -37,66 +31,6 @@ function verifyAuth(request: Request): { authorized: boolean; error?: string } {
 }
 
 /**
- * Execute snapshot ingestion logic
- */
-async function executeSnapshot() {
-  console.log('=== Snapshot Trigger START ===');
-  const startTime = new Date();
-
-  // Step 1: Fetch markets from Gamma API
-  const gammaMarkets = await fetchFromGammaAPI();
-  console.log(`Fetched ${gammaMarkets.length} markets from Gamma API`);
-
-  if (gammaMarkets.length === 0) {
-    return {
-      ok: false,
-      error: 'No markets received from Gamma API',
-      ranAt: startTime.toISOString(),
-      marketsUpserted: 0,
-      snapshotsInserted: 0,
-    };
-  }
-
-  // Step 2: Filter to active markets
-  const activeMarkets = gammaMarkets.filter(isMarketActive);
-  console.log(`Active markets: ${activeMarkets.length}/${gammaMarkets.length}`);
-
-  if (activeMarkets.length === 0) {
-    return {
-      ok: false,
-      error: 'No active markets after filtering',
-      ranAt: startTime.toISOString(),
-      marketsUpserted: 0,
-      snapshotsInserted: 0,
-    };
-  }
-
-  // Step 3: Normalize markets
-  const normalizedMarkets = activeMarkets.map(normalizeMarket);
-
-  // Remove temporary _urlSource field before upserting
-  const marketsForDb = normalizedMarkets.map(({ _urlSource, ...market }) => market);
-
-  // Step 4: Upsert markets to Supabase
-  await upsertMarketsToSupabase(marketsForDb);
-  const marketsUpserted = marketsForDb.length;
-  console.log(`Markets upserted: ${marketsUpserted}`);
-
-  // Step 5: Insert price snapshots
-  const snapshotsInserted = await insertPriceSnapshots(marketsForDb);
-  console.log(`Snapshots inserted: ${snapshotsInserted}`);
-
-  console.log('=== Snapshot Trigger END ===');
-
-  return {
-    ok: true,
-    ranAt: startTime.toISOString(),
-    marketsUpserted,
-    snapshotsInserted,
-  };
-}
-
-/**
  * GET /api/snapshot/run
  * Triggered by Vercel Cron every 5 minutes
  * Protected by secret query parameter
@@ -112,9 +46,20 @@ export async function GET(request: Request) {
       );
     }
 
-    // Execute snapshot
-    const result = await executeSnapshot();
-    return NextResponse.json(result, { status: result.ok ? 200 : 500 });
+    console.log('=== Snapshot Trigger START (Vercel Cron) ===');
+    const startTime = new Date();
+
+    // Execute ingestion
+    const result = await runIngestion();
+
+    console.log('=== Snapshot Trigger END ===');
+
+    return NextResponse.json({
+      ok: true,
+      ranAt: startTime.toISOString(),
+      marketsUpserted: result.marketsUpserted,
+      snapshotsInserted: result.snapshotsInserted,
+    });
   } catch (error) {
     console.error('Error in GET /api/snapshot/run:', error);
     return NextResponse.json(
@@ -122,6 +67,8 @@ export async function GET(request: Request) {
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to run snapshot',
         ranAt: new Date().toISOString(),
+        marketsUpserted: 0,
+        snapshotsInserted: 0,
       },
       { status: 500 }
     );
@@ -144,9 +91,20 @@ export async function POST(request: Request) {
       );
     }
 
-    // Execute snapshot
-    const result = await executeSnapshot();
-    return NextResponse.json(result, { status: result.ok ? 200 : 500 });
+    console.log('=== Snapshot Trigger START (Manual) ===');
+    const startTime = new Date();
+
+    // Execute ingestion
+    const result = await runIngestion();
+
+    console.log('=== Snapshot Trigger END ===');
+
+    return NextResponse.json({
+      ok: true,
+      ranAt: startTime.toISOString(),
+      marketsUpserted: result.marketsUpserted,
+      snapshotsInserted: result.snapshotsInserted,
+    });
   } catch (error) {
     console.error('Error in POST /api/snapshot/run:', error);
     return NextResponse.json(
@@ -154,6 +112,8 @@ export async function POST(request: Request) {
         ok: false,
         error: error instanceof Error ? error.message : 'Failed to run snapshot',
         ranAt: new Date().toISOString(),
+        marketsUpserted: 0,
+        snapshotsInserted: 0,
       },
       { status: 500 }
     );
