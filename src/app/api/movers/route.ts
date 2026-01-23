@@ -10,11 +10,11 @@ const WINDOW_HOURS: Record<WindowType, number> = {
 };
 
 // Tolerance ranges for finding past snapshot (in minutes)
-// How far from targetTime we'll accept a snapshot
+// How far from targetTime we'll accept a snapshot for "high confidence" match
 const WINDOW_TOLERANCE: Record<WindowType, number> = {
-  '1h': 30,    // +/- 30 minutes for 1h window
-  '6h': 120,   // +/- 2 hours for 6h window
-  '24h': 360,  // +/- 6 hours for 24h window
+  '1h': 90,    // +/- 90 minutes for 1h window (relaxed for irregular snapshots)
+  '6h': 180,   // +/- 3 hours for 6h window
+  '24h': 480,  // +/- 8 hours for 24h window
 };
 
 type SnapshotData = {
@@ -40,7 +40,8 @@ type MoverData = {
   change_pp: number;    // Probability points: change_abs * 100
   latest_time: string;  // Debug field
   past_time: string;    // Debug field
-  age_minutes: number;  // Debug field
+  delta_minutes: number;  // Actual time difference between snapshots
+  confidence: 'high' | 'low';  // high = within tolerance, low = fallback
 };
 
 /**
@@ -133,10 +134,11 @@ export async function GET(request: Request) {
       latest_time: string;
       past: number;
       past_time: string;
+      confidence: 'high' | 'low';
     }>();
 
     snapshotsByMarket.forEach((marketSnapshots, marketId) => {
-      if (marketSnapshots.length === 0) return;
+      if (marketSnapshots.length < 2) return; // Need at least 2 snapshots to compare
 
       // Sort by time descending (most recent first)
       marketSnapshots.sort((a, b) =>
@@ -157,6 +159,9 @@ export async function GET(request: Request) {
       let minTimeDiff = Infinity;
 
       for (const snap of marketSnapshots) {
+        // Skip the latest snapshot itself
+        if (snap.created_at === latest.created_at) continue;
+
         const snapTime = new Date(snap.created_at).getTime();
         const timeDiff = Math.abs(snapTime - targetTimeMs);
 
@@ -166,35 +171,74 @@ export async function GET(request: Request) {
         }
       }
 
-      // Check if closest snapshot is within tolerance
-      if (closestSnapshot && minTimeDiff <= toleranceMs) {
-        // Debug logging for specific market
-        if (debugMarketId && marketId === debugMarketId) {
-          console.log(`\n=== DEBUG: Market ${marketId} ===`);
-          console.log(`Latest snapshot: ${latest.created_at} (price: ${latest.yes_price})`);
-          console.log(`Target time: ${targetTime.toISOString()} (${hoursAgo}h ago from latest)`);
-          console.log(`Closest past snapshot: ${closestSnapshot.created_at} (price: ${closestSnapshot.yes_price})`);
-          console.log(`Time difference: ${Math.round(minTimeDiff / 60000)} minutes (tolerance: ${toleranceMinutes} min)`);
-          console.log(`Change: ${((latest.yes_price - closestSnapshot.yes_price) * 100).toFixed(2)} pp`);
+      if (!closestSnapshot) return; // No past snapshot found
+
+      let confidence: 'high' | 'low' = 'high';
+      let selectedSnapshot = closestSnapshot;
+
+      // Check if closest snapshot is within tolerance for high confidence
+      if (minTimeDiff > toleranceMs) {
+        // FALLBACK LOGIC: Outside tolerance, use fallback strategy
+        confidence = 'low';
+
+        // 1. Try to find snapshot BEFORE targetTime (prefer historical comparison)
+        let closestBefore: typeof marketSnapshots[0] | null = null;
+        let minDiffBefore = Infinity;
+
+        for (const snap of marketSnapshots) {
+          if (snap.created_at === latest.created_at) continue;
+          const snapTime = new Date(snap.created_at).getTime();
+
+          if (snapTime < targetTimeMs) {
+            const diff = targetTimeMs - snapTime;
+            if (diff < minDiffBefore) {
+              minDiffBefore = diff;
+              closestBefore = snap;
+            }
+          }
         }
 
-        marketData.set(marketId, {
-          latest: latest.yes_price,
-          latest_time: latest.created_at,
-          past: closestSnapshot.yes_price,
-          past_time: closestSnapshot.created_at,
-        });
-      } else {
-        // Debug logging for skipped market
-        if (debugMarketId && marketId === debugMarketId) {
-          console.log(`\n=== DEBUG: Market ${marketId} (SKIPPED) ===`);
-          console.log(`Latest snapshot: ${latest.created_at} (price: ${latest.yes_price})`);
-          console.log(`Target time: ${targetTime.toISOString()} (${hoursAgo}h ago from latest)`);
-          console.log(`Closest snapshot found: ${closestSnapshot?.created_at || 'none'}`);
-          console.log(`Time difference: ${Math.round(minTimeDiff / 60000)} minutes (tolerance: ${toleranceMinutes} min)`);
-          console.log(`REASON: No snapshot within tolerance window`);
+        // 2. If no snapshot before targetTime, try AFTER targetTime
+        if (!closestBefore) {
+          let closestAfter: typeof marketSnapshots[0] | null = null;
+          let minDiffAfter = Infinity;
+
+          for (const snap of marketSnapshots) {
+            if (snap.created_at === latest.created_at) continue;
+            const snapTime = new Date(snap.created_at).getTime();
+
+            if (snapTime > targetTimeMs && snapTime < latestTime.getTime()) {
+              const diff = snapTime - targetTimeMs;
+              if (diff < minDiffAfter) {
+                minDiffAfter = diff;
+                closestAfter = snap;
+              }
+            }
+          }
+
+          selectedSnapshot = closestAfter || closestSnapshot;
+        } else {
+          selectedSnapshot = closestBefore;
         }
       }
+
+      // Debug logging for specific market
+      if (debugMarketId && marketId === debugMarketId) {
+        console.log(`\n=== DEBUG: Market ${marketId} (confidence: ${confidence}) ===`);
+        console.log(`Latest snapshot: ${latest.created_at} (price: ${latest.yes_price})`);
+        console.log(`Target time: ${targetTime.toISOString()} (${hoursAgo}h ago from latest)`);
+        console.log(`Selected past snapshot: ${selectedSnapshot.created_at} (price: ${selectedSnapshot.yes_price})`);
+        console.log(`Time difference from target: ${Math.round(Math.abs(new Date(selectedSnapshot.created_at).getTime() - targetTimeMs) / 60000)} minutes (tolerance: ${toleranceMinutes} min)`);
+        console.log(`Change: ${((latest.yes_price - selectedSnapshot.yes_price) * 100).toFixed(2)} pp`);
+      }
+
+      marketData.set(marketId, {
+        latest: latest.yes_price,
+        latest_time: latest.created_at,
+        past: selectedSnapshot.yes_price,
+        past_time: selectedSnapshot.created_at,
+        confidence,
+      });
     });
 
     // Step 3: Fetch market metadata for all markets with price data
@@ -215,15 +259,15 @@ export async function GET(request: Request) {
       const priceData = marketData.get(market.id);
       if (!priceData) return;
 
-      const { latest, latest_time, past, past_time } = priceData;
+      const { latest, latest_time, past, past_time, confidence } = priceData;
 
       // Skip if past_price is 0 (would cause divide by zero)
       if (past === 0) return;
 
-      // Calculate age in minutes between snapshots
+      // Calculate actual time difference between snapshots (delta)
       const latestDate = new Date(latest_time);
       const pastDate = new Date(past_time);
-      const age_minutes = Math.round((latestDate.getTime() - pastDate.getTime()) / 60000);
+      const delta_minutes = Math.round((latestDate.getTime() - pastDate.getTime()) / 60000);
 
       const change_abs = latest - past;
       const change_pct = (change_abs / past) * 100;
@@ -248,7 +292,8 @@ export async function GET(request: Request) {
         change_pp,
         latest_time,  // Debug field
         past_time,    // Debug field
-        age_minutes,  // Debug field
+        delta_minutes,  // Actual time delta between snapshots
+        confidence,  // high = within tolerance, low = fallback
       });
     });
 
