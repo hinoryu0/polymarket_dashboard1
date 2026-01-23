@@ -348,6 +348,114 @@ export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<num
 }
 
 /**
+ * Create snapshots for ALL markets in the database
+ * This runs after market upsert to ensure we have snapshots for all markets, not just newly fetched ones
+ */
+export async function createSnapshotsForAllMarkets(): Promise<{
+  totalProcessed: number;
+  snapshotsCreated: number;
+  skippedNoPrice: number;
+  errors: number;
+}> {
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  if (!supabaseUrl || !supabaseKey) {
+    throw new Error('Missing Supabase configuration. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
+
+  console.log('\n=== Creating Snapshots for All Markets ===');
+
+  const BATCH_SIZE = 500; // Process 500 markets per batch
+  let offset = 0;
+  let totalProcessed = 0;
+  let snapshotsCreated = 0;
+  let skippedNoPrice = 0;
+  let errors = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    // Fetch a batch of markets from Supabase
+    const { data: markets, error: fetchError } = await supabase
+      .from('markets')
+      .select('id, yes_price, volume_usd')
+      .range(offset, offset + BATCH_SIZE - 1)
+      .order('id', { ascending: true }); // Consistent ordering for pagination
+
+    if (fetchError) {
+      console.error(`Error fetching markets batch at offset ${offset}:`, fetchError.message);
+      errors++;
+      break;
+    }
+
+    if (!markets || markets.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    console.log(`Processing batch: offset=${offset}, count=${markets.length}`);
+
+    // Filter markets with valid yes_price
+    const validMarkets = markets.filter(m => {
+      if (m.yes_price === null || m.yes_price === undefined || typeof m.yes_price !== 'number' || isNaN(m.yes_price)) {
+        skippedNoPrice++;
+        return false;
+      }
+      return true;
+    });
+
+    if (validMarkets.length > 0) {
+      // Prepare snapshots for insertion
+      const snapshots = validMarkets.map(m => ({
+        market_id: m.id,
+        yes_price: m.yes_price,
+        volume_usd: m.volume_usd,
+        // created_at will default to now() in database
+      }));
+
+      // Insert snapshots for this batch
+      const { error: insertError } = await supabase
+        .from('price_snapshots')
+        .insert(snapshots);
+
+      if (insertError) {
+        console.error(`Error inserting snapshots batch at offset ${offset}:`, insertError.message);
+        errors++;
+        // Continue with next batch even if this one fails
+      } else {
+        snapshotsCreated += snapshots.length;
+        console.log(`  ✓ Inserted ${snapshots.length} snapshots (skipped ${markets.length - validMarkets.length} with null price)`);
+      }
+    } else {
+      console.log(`  ⊘ Skipped entire batch - no markets with valid yes_price`);
+    }
+
+    totalProcessed += markets.length;
+    offset += BATCH_SIZE;
+
+    // If we got fewer markets than BATCH_SIZE, we've reached the end
+    if (markets.length < BATCH_SIZE) {
+      hasMore = false;
+    }
+  }
+
+  console.log('\n=== Snapshot Creation Complete ===');
+  console.log(`Total markets processed: ${totalProcessed}`);
+  console.log(`Snapshots created: ${snapshotsCreated}`);
+  console.log(`Skipped (no price): ${skippedNoPrice}`);
+  console.log(`Errors: ${errors}`);
+
+  return {
+    totalProcessed,
+    snapshotsCreated,
+    skippedNoPrice,
+    errors,
+  };
+}
+
+/**
  * Deduplicate markets by unique id
  * If duplicate ids exist, keeps the last occurrence (most recent data)
  * This prevents the Postgres error: "ON CONFLICT DO UPDATE command cannot affect row a second time"
@@ -460,20 +568,19 @@ export async function runIngestion(): Promise<IngestionResult> {
   await upsertMarketsToSupabase(deduplicatedMarkets);
   console.log(`Markets upserted: ${deduplicatedMarkets.length}`);
 
-  // Insert price snapshots (V1 Step 1: Historical price tracking)
-  // Use deduplicated markets to avoid inserting duplicate snapshots
-  const snapshotsInserted = await insertPriceSnapshots(deduplicatedMarkets);
-  console.log(`Snapshots inserted: ${snapshotsInserted}`);
+  // Insert price snapshots for ALL markets in database (not just newly fetched ones)
+  // This ensures we maintain historical price tracking for all markets
+  const snapshotStats = await createSnapshotsForAllMarkets();
 
   // Get current timestamp for last snapshot
-  const lastSnapshotCreatedAt = snapshotsInserted > 0 ? new Date().toISOString() : null;
+  const lastSnapshotCreatedAt = snapshotStats.snapshotsCreated > 0 ? new Date().toISOString() : null;
 
   console.log('=== Data Ingestion Completed Successfully ===');
-  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${deduplicatedMarkets.length}, Snapshots ${snapshotsInserted}`);
+  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${deduplicatedMarkets.length}, Snapshots ${snapshotStats.snapshotsCreated}`);
 
   const result: IngestionResult = {
     marketsUpserted: deduplicatedMarkets.length,
-    snapshotsInserted,
+    snapshotsInserted: snapshotStats.snapshotsCreated,
     fetchedMarketsTotal,
     keptMarketsTotal,
     filteredInactiveCount,
