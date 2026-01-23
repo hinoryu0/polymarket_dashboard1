@@ -36,6 +36,7 @@ type MoverData = {
   past_price: number;
   change_abs: number;
   change_pct: number;
+  change_pp: number;    // Probability points: change_abs * 100
   latest_time: string;  // Debug field
   past_time: string;    // Debug field
   age_minutes: number;  // Debug field
@@ -192,6 +193,7 @@ export async function GET(request: Request) {
 
       const change_abs = latest - past;
       const change_pct = (change_abs / past) * 100;
+      const change_pp = change_abs * 100; // Probability points
 
       // Extract slug from URL if possible (for backward compatibility)
       let slug: string | null = null;
@@ -209,6 +211,7 @@ export async function GET(request: Request) {
         past_price: past,
         change_abs,
         change_pct,
+        change_pp,
         latest_time,  // Debug field
         past_time,    // Debug field
         age_minutes,  // Debug field

@@ -13,6 +13,7 @@ type MoverData = {
   past_price: number;
   change_abs: number;
   change_pct: number;
+  change_pp: number; // Probability points
 };
 
 type MoversApiResponse = {
@@ -66,7 +67,7 @@ export default function MoversSection() {
 
   const formatChange = (change: number): string => {
     const sign = change >= 0 ? '+' : '';
-    return `${sign}${change.toFixed(1)}%`;
+    return `${sign}${change.toFixed(1)}pp`;
   };
 
   const formatVolume = (volume: number | null): string => {
@@ -118,7 +119,7 @@ export default function MoversSection() {
         </div>
         <div className="text-right">
           <p className={`text-sm font-semibold ${isGainer ? 'text-green-600' : 'text-red-600'}`}>
-            {formatChange(mover.change_pct)}
+            {formatChange(mover.change_pp)}
           </p>
         </div>
       </div>
