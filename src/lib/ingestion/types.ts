@@ -26,4 +26,9 @@ export type MarketRecord = {
 export type IngestionResult = {
   marketsUpserted: number;
   snapshotsInserted: number;
+  fetchedMarketsTotal: number;
+  keptMarketsTotal: number;
+  filteredInactiveCount: number;
+  filteredSportsCount: number;
+  lastSnapshotCreatedAt: string | null;
 };

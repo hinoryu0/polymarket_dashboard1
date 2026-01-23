@@ -19,8 +19,13 @@ async function main() {
 
     // Log final summary
     console.log('\n=== Ingestion Summary ===');
+    console.log(`Fetched (total): ${result.fetchedMarketsTotal}`);
+    console.log(`Filtered (inactive): ${result.filteredInactiveCount}`);
+    console.log(`Filtered (sports): ${result.filteredSportsCount}`);
+    console.log(`Kept (total): ${result.keptMarketsTotal}`);
     console.log(`Markets upserted: ${result.marketsUpserted}`);
     console.log(`Snapshots inserted: ${result.snapshotsInserted}`);
+    console.log(`Last snapshot: ${result.lastSnapshotCreatedAt || 'N/A'}`);
 
     process.exit(0);
   } catch (error) {

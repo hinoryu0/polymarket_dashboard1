@@ -8,23 +8,22 @@ import type { GammaMarket, MarketRecord, IngestionResult } from './types';
 
 // Configuration
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets';
-const FETCH_TIMEOUT = 10000; // 10 seconds
+const FETCH_TIMEOUT = 15000; // 15 seconds (increased for pagination)
 const MAX_RETRIES = 1;
-
-// Query parameters to fetch only active markets
-const QUERY_PARAMS = '?active=true&closed=false&limit=100';
+const PAGE_SIZE = 100; // Fetch 100 markets per page
 
 /**
- * Fetch markets from Gamma API with timeout and retry
+ * Fetch a single page of markets from Gamma API with timeout and retry
  */
-export async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> {
+async function fetchPageFromGammaAPI(offset: number, retryCount = 0): Promise<GammaMarket[]> {
   try {
-    console.log(`Fetching markets from Gamma API (attempt ${retryCount + 1})...`);
+    const queryParams = `?active=true&closed=false&limit=${PAGE_SIZE}&offset=${offset}`;
+    console.log(`Fetching page at offset ${offset} (attempt ${retryCount + 1})...`);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
-    const response = await fetch(`${GAMMA_API_URL}${QUERY_PARAMS}`, {
+    const response = await fetch(`${GAMMA_API_URL}${queryParams}`, {
       signal: controller.signal,
       headers: {
         'Accept': 'application/json',
@@ -42,20 +41,58 @@ export async function fetchFromGammaAPI(retryCount = 0): Promise<GammaMarket[]> 
     // Handle different response formats
     const markets = Array.isArray(data) ? data : (data.markets || []);
 
-    console.log(`Successfully fetched ${markets.length} markets from Gamma API`);
+    console.log(`Fetched ${markets.length} markets at offset ${offset}`);
     return markets;
   } catch (error) {
-    console.error(`Error fetching from Gamma API (attempt ${retryCount + 1}):`, error);
+    console.error(`Error fetching page at offset ${offset} (attempt ${retryCount + 1}):`, error);
 
     // Retry once if this was the first attempt
     if (retryCount < MAX_RETRIES) {
       console.log('Retrying...');
       await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
-      return fetchFromGammaAPI(retryCount + 1);
+      return fetchPageFromGammaAPI(offset, retryCount + 1);
     }
 
     throw error;
   }
+}
+
+/**
+ * Fetch ALL markets from Gamma API using pagination
+ * Continues fetching until no more results are returned
+ */
+export async function fetchFromGammaAPI(): Promise<GammaMarket[]> {
+  console.log('Starting to fetch ALL markets from Gamma API with pagination...');
+
+  const allMarkets: GammaMarket[] = [];
+  let offset = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    const pageMarkets = await fetchPageFromGammaAPI(offset);
+
+    if (pageMarkets.length === 0) {
+      // No more markets to fetch
+      hasMore = false;
+      console.log(`No more markets at offset ${offset}. Pagination complete.`);
+    } else {
+      allMarkets.push(...pageMarkets);
+      offset += pageMarkets.length;
+
+      // If we got fewer markets than the page size, we're on the last page
+      if (pageMarkets.length < PAGE_SIZE) {
+        hasMore = false;
+        console.log(`Received ${pageMarkets.length} markets (less than page size). Last page reached.`);
+      } else {
+        console.log(`Total markets fetched so far: ${allMarkets.length}. Continuing...`);
+        // Add a small delay between requests to be respectful to the API
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+  }
+
+  console.log(`Successfully fetched ${allMarkets.length} total markets from Gamma API`);
+  return allMarkets;
 }
 
 /**
@@ -73,6 +110,67 @@ export function isMarketActive(market: GammaMarket): boolean {
   }
 
   return true;
+}
+
+/**
+ * Check if a market is sports-related
+ * Uses heuristics based on tags, categories, and title keywords
+ */
+export function isSportsMarket(market: GammaMarket): boolean {
+  // Check tags (if present)
+  if (market.tags && Array.isArray(market.tags)) {
+    const tagsStr = market.tags.join(' ').toLowerCase();
+    if (tagsStr.includes('sports') ||
+        tagsStr.includes('nfl') ||
+        tagsStr.includes('nba') ||
+        tagsStr.includes('mlb') ||
+        tagsStr.includes('nhl') ||
+        tagsStr.includes('soccer') ||
+        tagsStr.includes('football') ||
+        tagsStr.includes('basketball') ||
+        tagsStr.includes('baseball') ||
+        tagsStr.includes('hockey')) {
+      return true;
+    }
+  }
+
+  // Check category (if present)
+  if (market.category) {
+    const categoryStr = market.category.toLowerCase();
+    if (categoryStr.includes('sports') ||
+        categoryStr.includes('nfl') ||
+        categoryStr.includes('nba') ||
+        categoryStr.includes('mlb') ||
+        categoryStr.includes('nhl') ||
+        categoryStr.includes('soccer') ||
+        categoryStr.includes('football') ||
+        categoryStr.includes('basketball') ||
+        categoryStr.includes('baseball') ||
+        categoryStr.includes('hockey')) {
+      return true;
+    }
+  }
+
+  // Check title/question for sports keywords
+  const title = (market.question || '').toLowerCase();
+
+  // Common sports patterns
+  const sportsPatterns = [
+    /\b(nfl|nba|mlb|nhl|ufc|mma|fifa)\b/,
+    /\b(super bowl|world series|stanley cup|world cup)\b/,
+    /\b(playoff|championship|league|division|conference)\b.*\b(win|winner|champion)/,
+    /\b(team|teams)\b.*\b(win|score|beat|defeat)/,
+    /\b(player|athlete)\b.*\b(score|points|goals|touchdowns)/,
+    /\b(game|match)\b.*\b(win|score|result)/,
+  ];
+
+  for (const pattern of sportsPatterns) {
+    if (pattern.test(title)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -255,26 +353,51 @@ export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<num
 export async function runIngestion(): Promise<IngestionResult> {
   console.log('=== Polymarket Data Ingestion Starting ===');
 
-  // Fetch markets from Gamma API
+  // Fetch ALL markets from Gamma API (with pagination)
   const gammaMarkets = await fetchFromGammaAPI();
-  console.log(`Total fetched: ${gammaMarkets.length}`);
+  const fetchedMarketsTotal = gammaMarkets.length;
+  console.log(`Total fetched: ${fetchedMarketsTotal}`);
 
-  if (gammaMarkets.length === 0) {
+  if (fetchedMarketsTotal === 0) {
     console.warn('No markets received from Gamma API');
-    return { marketsUpserted: 0, snapshotsInserted: 0 };
+    return {
+      marketsUpserted: 0,
+      snapshotsInserted: 0,
+      fetchedMarketsTotal: 0,
+      keptMarketsTotal: 0,
+      filteredInactiveCount: 0,
+      filteredSportsCount: 0,
+      lastSnapshotCreatedAt: null,
+    };
   }
 
-  // Filter to keep only active/tradeable markets
+  // Filter out inactive markets
   const activeMarkets = gammaMarkets.filter(isMarketActive);
-  console.log(`Total kept after filtering: ${activeMarkets.length} (filtered out ${gammaMarkets.length - activeMarkets.length} inactive markets)`);
+  const filteredInactiveCount = fetchedMarketsTotal - activeMarkets.length;
+  console.log(`Active markets: ${activeMarkets.length} (filtered out ${filteredInactiveCount} inactive markets)`);
 
-  if (activeMarkets.length === 0) {
-    console.warn('No active markets after filtering');
-    return { marketsUpserted: 0, snapshotsInserted: 0 };
+  // Filter out sports markets
+  const nonSportsMarkets = activeMarkets.filter(market => !isSportsMarket(market));
+  const filteredSportsCount = activeMarkets.length - nonSportsMarkets.length;
+  console.log(`Non-sports markets: ${nonSportsMarkets.length} (filtered out ${filteredSportsCount} sports markets)`);
+
+  const keptMarketsTotal = nonSportsMarkets.length;
+
+  if (keptMarketsTotal === 0) {
+    console.warn('No markets remaining after filtering');
+    return {
+      marketsUpserted: 0,
+      snapshotsInserted: 0,
+      fetchedMarketsTotal,
+      keptMarketsTotal: 0,
+      filteredInactiveCount,
+      filteredSportsCount,
+      lastSnapshotCreatedAt: null,
+    };
   }
 
   // Normalize to our format
-  const normalizedMarkets = activeMarkets.map(normalizeMarket);
+  const normalizedMarkets = nonSportsMarkets.map(normalizeMarket);
 
   // Count markets with valid yes_price
   const marketsWithPrice = normalizedMarkets.filter(m => m.yes_price !== null);
@@ -309,10 +432,46 @@ export async function runIngestion(): Promise<IngestionResult> {
   const snapshotsInserted = await insertPriceSnapshots(marketsForDb);
   console.log(`Snapshots inserted: ${snapshotsInserted}`);
 
-  console.log('=== Data Ingestion Completed Successfully ===');
+  // Get current timestamp for last snapshot
+  const lastSnapshotCreatedAt = snapshotsInserted > 0 ? new Date().toISOString() : null;
 
-  return {
+  console.log('=== Data Ingestion Completed Successfully ===');
+  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${marketsForDb.length}, Snapshots ${snapshotsInserted}`);
+
+  const result: IngestionResult = {
     marketsUpserted: marketsForDb.length,
     snapshotsInserted,
+    fetchedMarketsTotal,
+    keptMarketsTotal,
+    filteredInactiveCount,
+    filteredSportsCount,
+    lastSnapshotCreatedAt,
   };
+
+  // Store the result for /api/health to read
+  await saveIngestionResult(result);
+
+  return result;
+}
+
+/**
+ * Save ingestion result to a file for /api/health to read
+ * This allows the health endpoint to show stats from the last ingestion run
+ */
+async function saveIngestionResult(result: IngestionResult): Promise<void> {
+  try {
+    // Only save in Node.js environment (not in browser/edge runtime)
+    if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+      const fs = await import('fs/promises');
+      const path = await import('path');
+
+      // Store in project root or tmp directory
+      const filePath = path.join(process.cwd(), '.last-ingestion.json');
+      await fs.writeFile(filePath, JSON.stringify(result, null, 2), 'utf-8');
+      console.log(`Saved ingestion stats to ${filePath}`);
+    }
+  } catch (error) {
+    // Don't fail the ingestion if we can't save the stats file
+    console.warn('Failed to save ingestion stats file:', error);
+  }
 }
