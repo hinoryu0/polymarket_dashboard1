@@ -1,11 +1,13 @@
 name: Polymarket Data Sync
 
 on:
-  # Run every 5 minutes
+  # Run every 5 minutes to maintain fresh price snapshots for historical tracking
+  # This frequency ensures /api/movers has sufficient data for 1h/6h/24h windows
+  # Expected snapshots per window: 1h=12, 6h=72, 24h=288
   schedule:
     - cron: '*/15 * * * *'
 
-  # Allow manual trigger
+  # Allow manual trigger for testing or immediate sync
   workflow_dispatch:
 
 # Prevent concurrent runs but don't cancel scheduled jobs
@@ -23,6 +25,7 @@ jobs:
           echo "=== Polymarket Data Sync START === $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           echo "Workflow run: ${{ github.run_number }}"
           echo "Triggered by: ${{ github.event_name }}"
+          echo "Snapshot frequency: Every 5 minutes (12 snapshots/hour)"
 
       - name: Checkout repository
         uses: actions/checkout@v4

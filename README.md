@@ -166,6 +166,12 @@ The workflow file `.github/workflows/polymarket-sync.yml` is already configured 
 - Run every 5 minutes (cron: `*/5 * * * *`)
 - Support manual dispatch (you can trigger it manually from GitHub UI)
 
+**Snapshot Frequency Details:**
+- Every run creates price snapshots for ALL markets (~22,000 markets)
+- 5-minute frequency provides: 12 snapshots/hour, 72 snapshots/6h, 288 snapshots/24h
+- This ensures sufficient historical data for `/api/movers` to calculate price changes
+- Minimum viable data: ~6-12 snapshots needed for 1h movers window
+
 ### 3. Monitor the Workflow
 
 - Go to **Actions** tab in your GitHub repository
@@ -254,14 +260,47 @@ Fetches markets from Supabase database.
 }
 ```
 
-**Error Response**:
+### GET /api/movers
+
+Returns top gaining and losing markets based on price changes over time.
+
+**Query Parameters**:
+- `window` (optional): Time window - `1h`, `6h`, or `24h` (default: `24h`)
+- `limit` (optional): Number of gainers/losers to return (1-50, default: 10)
+- `debugMarketId` (optional): Market ID to show debug logging for
+
+**Response**:
 ```json
 {
-  "success": false,
-  "error": "Error message",
-  "markets": []
+  "window": "24h",
+  "limit": 10,
+  "generatedAt": "2026-01-23T12:00:00.000Z",
+  "topGainers": [
+    {
+      "market_id": "...",
+      "title": "Will X happen?",
+      "latest_price": 0.75,
+      "past_price": 0.45,
+      "change_pp": 30.0,
+      "change_pct": 66.67,
+      "volume_usd": 500000
+    }
+  ],
+  "topLosers": [...]
 }
 ```
+
+### GET /api/debug/snapshots
+
+Diagnostic endpoint for snapshot health status.
+
+**Response**: Returns stats about price snapshots in the last 48h including total count, distinct markets, newest/oldest timestamps, and sample data.
+
+### GET /api/debug/coverage
+
+Diagnostic endpoint for snapshot coverage analysis.
+
+**Response**: Returns what percentage of markets have snapshots, identifies markets without snapshots, and provides health recommendations.
 
 ## Troubleshooting
 
