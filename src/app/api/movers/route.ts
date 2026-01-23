@@ -9,11 +9,12 @@ const WINDOW_HOURS: Record<WindowType, number> = {
   '24h': 24,
 };
 
-// Tolerance ranges for each window (in minutes)
-const WINDOW_TOLERANCE: Record<WindowType, { min: number; max: number }> = {
-  '1h': { min: 45, max: 75 },   // 45-75 minutes ago
-  '6h': { min: 300, max: 420 }, // 5-7 hours ago
-  '24h': { min: 1320, max: 1560 }, // 22-26 hours ago
+// Tolerance ranges for finding past snapshot (in minutes)
+// How far from targetTime we'll accept a snapshot
+const WINDOW_TOLERANCE: Record<WindowType, number> = {
+  '1h': 30,    // +/- 30 minutes for 1h window
+  '6h': 120,   // +/- 2 hours for 6h window
+  '24h': 360,  // +/- 6 hours for 24h window
 };
 
 type SnapshotData = {
@@ -51,6 +52,7 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const windowParam = searchParams.get('window') || '24h';
     const limitParam = searchParams.get('limit') || '10';
+    const debugMarketId = searchParams.get('debugMarketId'); // Optional debug param
 
     // Validate window
     if (!['1h', '6h', '24h'].includes(windowParam)) {
@@ -71,10 +73,8 @@ export async function GET(request: Request) {
 
     const window = windowParam as WindowType;
     const hoursAgo = WINDOW_HOURS[window];
-
-    // Calculate target time (window ago)
+    const toleranceMinutes = WINDOW_TOLERANCE[window];
     const now = new Date();
-    const targetTime = new Date(now.getTime() - hoursAgo * 60 * 60 * 1000);
 
     // Initialize Supabase client
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -86,74 +86,115 @@ export async function GET(request: Request) {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Step 1: Get latest snapshot per market (most recent yes_price)
-    const { data: latestSnapshots, error: latestError } = await supabase
+    // Fetch all snapshots from recent history (cover up to 48h to handle 24h window + buffer)
+    // This prevents loading too much data while ensuring we have enough history
+    const lookbackHours = Math.max(hoursAgo * 2, 48); // At least 48h lookback
+    const oldestTime = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
+
+    const { data: snapshots, error: snapshotsError } = await supabase
       .from('price_snapshots')
       .select('market_id, yes_price, created_at')
       .not('yes_price', 'is', null)
+      .gte('created_at', oldestTime.toISOString())
       .order('created_at', { ascending: false });
 
-    if (latestError) {
-      throw new Error(`Failed to fetch latest snapshots: ${latestError.message}`);
+    if (snapshotsError) {
+      throw new Error(`Failed to fetch snapshots: ${snapshotsError.message}`);
     }
 
-    // Step 2: Get past snapshots (closest to target time, but not after)
-    const { data: pastSnapshots, error: pastError } = await supabase
-      .from('price_snapshots')
-      .select('market_id, yes_price, created_at')
-      .not('yes_price', 'is', null)
-      .lte('created_at', targetTime.toISOString())
-      .order('created_at', { ascending: false });
-
-    if (pastError) {
-      throw new Error(`Failed to fetch past snapshots: ${pastError.message}`);
+    if (!snapshots || snapshots.length === 0) {
+      console.warn('No snapshots found in database');
+      return NextResponse.json({
+        window,
+        limit,
+        generatedAt: now.toISOString(),
+        topGainers: [],
+        topLosers: [],
+      });
     }
 
-    // Process snapshots to get latest and past prices per market WITH timestamps
+    // Group snapshots by market_id
+    const snapshotsByMarket = new Map<string, Array<{ yes_price: number; created_at: string }>>();
+    snapshots.forEach((snap) => {
+      if (snap.yes_price === null) return;
+
+      if (!snapshotsByMarket.has(snap.market_id)) {
+        snapshotsByMarket.set(snap.market_id, []);
+      }
+      snapshotsByMarket.get(snap.market_id)!.push({
+        yes_price: snap.yes_price,
+        created_at: snap.created_at,
+      });
+    });
+
+    // Process each market to find latest and closest past snapshot
     const marketData = new Map<string, {
-      latest: number | null;
-      latest_time: string | null;
-      past: number | null;
-      past_time: string | null;
+      latest: number;
+      latest_time: string;
+      past: number;
+      past_time: string;
     }>();
 
-    // Get latest price and timestamp per market (first occurrence in desc order)
-    const latestByMarket = new Map<string, { price: number; time: string }>();
-    latestSnapshots?.forEach((snap) => {
-      if (!latestByMarket.has(snap.market_id) && snap.yes_price !== null) {
-        latestByMarket.set(snap.market_id, {
-          price: snap.yes_price,
-          time: snap.created_at
-        });
+    snapshotsByMarket.forEach((marketSnapshots, marketId) => {
+      if (marketSnapshots.length === 0) return;
+
+      // Sort by time descending (most recent first)
+      marketSnapshots.sort((a, b) =>
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      );
+
+      // Latest snapshot is the first one (most recent)
+      const latest = marketSnapshots[0];
+      const latestTime = new Date(latest.created_at);
+
+      // Calculate target time for this specific market
+      const targetTime = new Date(latestTime.getTime() - hoursAgo * 60 * 60 * 1000);
+      const targetTimeMs = targetTime.getTime();
+      const toleranceMs = toleranceMinutes * 60 * 1000;
+
+      // Find snapshot closest to targetTime (minimum absolute difference)
+      let closestSnapshot: typeof marketSnapshots[0] | null = null;
+      let minTimeDiff = Infinity;
+
+      for (const snap of marketSnapshots) {
+        const snapTime = new Date(snap.created_at).getTime();
+        const timeDiff = Math.abs(snapTime - targetTimeMs);
+
+        if (timeDiff < minTimeDiff) {
+          minTimeDiff = timeDiff;
+          closestSnapshot = snap;
+        }
       }
-    });
 
-    // Get past price and timestamp per market (first occurrence in desc order <= target time)
-    const pastByMarket = new Map<string, { price: number; time: string }>();
-    pastSnapshots?.forEach((snap) => {
-      if (!pastByMarket.has(snap.market_id) && snap.yes_price !== null) {
-        pastByMarket.set(snap.market_id, {
-          price: snap.yes_price,
-          time: snap.created_at
+      // Check if closest snapshot is within tolerance
+      if (closestSnapshot && minTimeDiff <= toleranceMs) {
+        // Debug logging for specific market
+        if (debugMarketId && marketId === debugMarketId) {
+          console.log(`\n=== DEBUG: Market ${marketId} ===`);
+          console.log(`Latest snapshot: ${latest.created_at} (price: ${latest.yes_price})`);
+          console.log(`Target time: ${targetTime.toISOString()} (${hoursAgo}h ago from latest)`);
+          console.log(`Closest past snapshot: ${closestSnapshot.created_at} (price: ${closestSnapshot.yes_price})`);
+          console.log(`Time difference: ${Math.round(minTimeDiff / 60000)} minutes (tolerance: ${toleranceMinutes} min)`);
+          console.log(`Change: ${((latest.yes_price - closestSnapshot.yes_price) * 100).toFixed(2)} pp`);
+        }
+
+        marketData.set(marketId, {
+          latest: latest.yes_price,
+          latest_time: latest.created_at,
+          past: closestSnapshot.yes_price,
+          past_time: closestSnapshot.created_at,
         });
+      } else {
+        // Debug logging for skipped market
+        if (debugMarketId && marketId === debugMarketId) {
+          console.log(`\n=== DEBUG: Market ${marketId} (SKIPPED) ===`);
+          console.log(`Latest snapshot: ${latest.created_at} (price: ${latest.yes_price})`);
+          console.log(`Target time: ${targetTime.toISOString()} (${hoursAgo}h ago from latest)`);
+          console.log(`Closest snapshot found: ${closestSnapshot?.created_at || 'none'}`);
+          console.log(`Time difference: ${Math.round(minTimeDiff / 60000)} minutes (tolerance: ${toleranceMinutes} min)`);
+          console.log(`REASON: No snapshot within tolerance window`);
+        }
       }
-    });
-
-    // Combine data
-    const allMarketIds = new Set([
-      ...Array.from(latestByMarket.keys()),
-      ...Array.from(pastByMarket.keys())
-    ]);
-    allMarketIds.forEach((marketId) => {
-      const latest = latestByMarket.get(marketId);
-      const past = pastByMarket.get(marketId);
-
-      marketData.set(marketId, {
-        latest: latest?.price || null,
-        latest_time: latest?.time || null,
-        past: past?.price || null,
-        past_time: past?.time || null,
-      });
     });
 
     // Step 3: Fetch market metadata for all markets with price data
@@ -167,9 +208,8 @@ export async function GET(request: Request) {
       throw new Error(`Failed to fetch market metadata: ${marketsError.message}`);
     }
 
-    // Step 4: Compute movers with tolerance checking
+    // Step 4: Compute movers
     const movers: MoverData[] = [];
-    const tolerance = WINDOW_TOLERANCE[window];
 
     markets?.forEach((market) => {
       const priceData = marketData.get(market.id);
@@ -177,23 +217,17 @@ export async function GET(request: Request) {
 
       const { latest, latest_time, past, past_time } = priceData;
 
-      // Skip if missing prices, timestamps, or past_price is 0/null
-      if (latest === null || past === null || past === 0) return;
-      if (!latest_time || !past_time) return;
+      // Skip if past_price is 0 (would cause divide by zero)
+      if (past === 0) return;
 
       // Calculate age in minutes between snapshots
       const latestDate = new Date(latest_time);
       const pastDate = new Date(past_time);
       const age_minutes = Math.round((latestDate.getTime() - pastDate.getTime()) / 60000);
 
-      // TOLERANCE CHECK: Skip if age is outside the acceptable range for this window
-      if (age_minutes < tolerance.min || age_minutes > tolerance.max) {
-        return; // Skip this market - data is too old or too recent
-      }
-
       const change_abs = latest - past;
       const change_pct = (change_abs / past) * 100;
-      const change_pp = change_abs * 100; // Probability points
+      const change_pp = change_abs * 100; // Probability points (change in percentage points)
 
       // Extract slug from URL if possible (for backward compatibility)
       let slug: string | null = null;
@@ -218,18 +252,18 @@ export async function GET(request: Request) {
       });
     });
 
-    // Step 5: Sort and limit
+    // Step 5: Sort by change_pp (percentage points) and limit
     const topGainers = movers
-      .filter((m) => m.change_abs > 0)
-      .sort((a, b) => b.change_abs - a.change_abs)
+      .filter((m) => m.change_pp > 0)
+      .sort((a, b) => b.change_pp - a.change_pp)
       .slice(0, limit);
 
     const topLosers = movers
-      .filter((m) => m.change_abs < 0)
-      .sort((a, b) => a.change_abs - b.change_abs)
+      .filter((m) => m.change_pp < 0)
+      .sort((a, b) => a.change_pp - b.change_pp)
       .slice(0, limit);
 
-    console.log(`Movers computed for window=${window}, markets=${movers.length}`);
+    console.log(`Movers computed for window=${window}, total_markets_with_data=${movers.length}, gainers=${topGainers.length}, losers=${topLosers.length}`);
 
     return NextResponse.json({
       window,
