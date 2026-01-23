@@ -348,6 +348,23 @@ export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<num
 }
 
 /**
+ * Deduplicate markets by unique id
+ * If duplicate ids exist, keeps the last occurrence (most recent data)
+ * This prevents the Postgres error: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+ */
+export function deduplicateMarketsById(markets: MarketRecord[]): MarketRecord[] {
+  const marketMap = new Map<string, MarketRecord>();
+
+  for (const market of markets) {
+    // Use Map to ensure only one entry per id
+    // If id already exists, this will overwrite with the latest occurrence
+    marketMap.set(market.id, market);
+  }
+
+  return Array.from(marketMap.values());
+}
+
+/**
  * Main ingestion function that can be called from API routes or CLI scripts
  */
 export async function runIngestion(): Promise<IngestionResult> {
@@ -424,22 +441,38 @@ export async function runIngestion(): Promise<IngestionResult> {
   // Remove temporary _urlSource field before upserting to Supabase
   const marketsForDb = normalizedMarkets.map(({ _urlSource, ...market }) => market);
 
+  // Deduplicate markets by id to avoid Supabase upsert conflict error
+  // "ON CONFLICT DO UPDATE command cannot affect row a second time"
+  const beforeDedupeCount = marketsForDb.length;
+  const deduplicatedMarkets = deduplicateMarketsById(marketsForDb);
+  const afterDedupeCount = deduplicatedMarkets.length;
+  const duplicatesRemoved = beforeDedupeCount - afterDedupeCount;
+
+  console.log('\n=== Deduplication Summary ===');
+  console.log(`Markets before deduplication: ${beforeDedupeCount}`);
+  console.log(`Markets after deduplication: ${afterDedupeCount}`);
+  console.log(`Duplicate markets removed: ${duplicatesRemoved}`);
+  if (duplicatesRemoved > 0) {
+    console.log(`⚠️  WARNING: Found ${duplicatesRemoved} duplicate market(s)! This may indicate an issue with the API or pagination logic.`);
+  }
+
   // Upsert to Supabase
-  await upsertMarketsToSupabase(marketsForDb);
-  console.log(`Markets upserted: ${marketsForDb.length}`);
+  await upsertMarketsToSupabase(deduplicatedMarkets);
+  console.log(`Markets upserted: ${deduplicatedMarkets.length}`);
 
   // Insert price snapshots (V1 Step 1: Historical price tracking)
-  const snapshotsInserted = await insertPriceSnapshots(marketsForDb);
+  // Use deduplicated markets to avoid inserting duplicate snapshots
+  const snapshotsInserted = await insertPriceSnapshots(deduplicatedMarkets);
   console.log(`Snapshots inserted: ${snapshotsInserted}`);
 
   // Get current timestamp for last snapshot
   const lastSnapshotCreatedAt = snapshotsInserted > 0 ? new Date().toISOString() : null;
 
   console.log('=== Data Ingestion Completed Successfully ===');
-  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${marketsForDb.length}, Snapshots ${snapshotsInserted}`);
+  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${deduplicatedMarkets.length}, Snapshots ${snapshotsInserted}`);
 
   const result: IngestionResult = {
-    marketsUpserted: marketsForDb.length,
+    marketsUpserted: deduplicatedMarkets.length,
     snapshotsInserted,
     fetchedMarketsTotal,
     keptMarketsTotal,
