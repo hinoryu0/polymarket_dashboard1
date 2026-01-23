@@ -1,8 +1,0 @@
-{
-  "crons": [
-    {
-      "path": "/api/snapshot/run?secret=$CRON_SECRET",
-      "schedule": "*/5 * * * *"
-    }
-  ]
-}

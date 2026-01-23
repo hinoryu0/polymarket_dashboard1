@@ -5,7 +5,7 @@
  * It's designed to run in GitHub Actions every 5 minutes or can be run manually.
  *
  * The core logic is in src/lib/ingestion/runIngestion.ts and is shared
- * with the API route at /api/snapshot/run (for Vercel Cron).
+ * with the API route at /api/snapshot/run (for manual triggering).
  */
 
 import { runIngestion } from '../src/lib/ingestion/runIngestion';

@@ -10,7 +10,7 @@ A Next.js-based dashboard that displays live Polymarket market data, designed to
 - Auto-refresh capability
 - Responsive UI with TailwindCSS
 - TypeScript for type safety
-- Automated data sync via GitHub Actions and Vercel cron
+- Automated data sync via GitHub Actions
 
 ## Tech Stack
 
