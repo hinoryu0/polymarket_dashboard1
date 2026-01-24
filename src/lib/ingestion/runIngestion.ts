@@ -176,7 +176,35 @@ export function isSportsMarket(market: GammaMarket): boolean {
 /**
  * Normalize Gamma API market data to our database format
  */
-export function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
+export function normalizeMarket(gammaMarket: GammaMarket, debugMarketId?: string): MarketRecord {
+  const isDebugMarket = debugMarketId && gammaMarket.id === debugMarketId;
+
+  if (isDebugMarket) {
+    console.log('\n========================================');
+    console.log('🔍 DEBUG MODE - Raw Gamma API Payload');
+    console.log('========================================');
+    console.log('Market ID:', gammaMarket.id);
+    console.log('Question/Title:', gammaMarket.question || gammaMarket.title || 'N/A');
+    console.log('Slug:', gammaMarket.slug || 'N/A');
+    console.log('\n--- RAW API FIELDS ---');
+    console.log('outcomes (raw):', JSON.stringify(gammaMarket.outcomes, null, 2));
+    console.log('outcomePrices (raw):', JSON.stringify(gammaMarket.outcomePrices, null, 2));
+    console.log('\n--- TOKEN/PRICE FIELDS (if exists) ---');
+    console.log('tokens:', JSON.stringify(gammaMarket.tokens, null, 2));
+    console.log('bestBid:', gammaMarket.bestBid);
+    console.log('bestAsk:', gammaMarket.bestAsk);
+    console.log('lastPrice:', gammaMarket.lastPrice);
+    console.log('\n--- VOLUME FIELDS ---');
+    console.log('volume:', gammaMarket.volume);
+    console.log('volumeNum:', gammaMarket.volumeNum);
+    console.log('volumeUSD:', gammaMarket.volumeUSD);
+    console.log('volume24h:', gammaMarket.volume24h);
+    console.log('volume24hr:', gammaMarket.volume24hr);
+    console.log('\n--- ALL AVAILABLE KEYS ---');
+    console.log(Object.keys(gammaMarket).sort().join(', '));
+    console.log('========================================\n');
+  }
+
   // Extract yes price
   // Gamma API returns outcomes and outcomePrices as STRINGIFIED JSON arrays
   // Example: outcomes = '["Yes", "No"]', outcomePrices = '["0.65", "0.35"]'
@@ -199,11 +227,21 @@ export function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
       prices = gammaMarket.outcomePrices;
     }
 
+    if (isDebugMarket) {
+      console.log('📊 PARSED ARRAYS:');
+      console.log('  outcomes:', outcomes);
+      console.log('  prices:', prices);
+    }
+
     // Find the "Yes" outcome (case-insensitive)
     if (outcomes.length > 0 && prices.length > 0) {
       const yesIndex = outcomes.findIndex(
         outcome => outcome.toLowerCase().trim() === 'yes'
       );
+
+      if (isDebugMarket) {
+        console.log('  yesIndex:', yesIndex);
+      }
 
       if (yesIndex !== -1 && yesIndex < prices.length) {
         const priceStr = prices[yesIndex];
@@ -211,8 +249,17 @@ export function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
         // Validate: must be a number AND between 0 and 1 (inclusive)
         if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) {
           yesPrice = parsed;
+          if (isDebugMarket) {
+            console.log(`  ✅ Found Yes at index ${yesIndex}: "${priceStr}" → ${parsed}`);
+          }
+        } else if (isDebugMarket) {
+          console.log(`  ❌ Invalid price at Yes index ${yesIndex}: "${priceStr}" → ${parsed} (out of range 0-1)`);
         }
+      } else if (isDebugMarket) {
+        console.log('  ❌ No "Yes" outcome found in outcomes array');
       }
+    } else if (isDebugMarket) {
+      console.log('  ⚠️  Empty outcomes or prices array');
     }
   } catch (error) {
     // Failed to parse - yesPrice remains null
@@ -226,6 +273,20 @@ export function normalizeMarket(gammaMarket: GammaMarket): MarketRecord {
     if (!isNaN(parsed)) {
       volumeUsd = parsed;
     }
+  }
+
+  if (isDebugMarket) {
+    console.log('\n💰 VOLUME EXTRACTION:');
+    console.log('  Using field: gammaMarket.volume');
+    console.log('  Raw value:', gammaMarket.volume);
+    console.log('  Parsed volumeUsd:', volumeUsd);
+  }
+
+  if (isDebugMarket) {
+    console.log('\n✅ FINAL MAPPED VALUES:');
+    console.log('  yes_price:', yesPrice);
+    console.log('  volume_usd:', volumeUsd);
+    console.log('========================================\n');
   }
 
   // Build market URL using priority order to avoid 404s
@@ -308,6 +369,8 @@ export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<num
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
+  const debugMarketId = process.env.DEBUG_MARKET_ID;
+
   // Filter markets to only those with valid yes_price
   const snapshotsToInsert = markets
     .filter(market => {
@@ -331,6 +394,22 @@ export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<num
   if (snapshotsToInsert.length === 0) {
     console.log('No valid snapshots to insert (no markets with valid yes_price)');
     return 0;
+  }
+
+  // Debug output for specific market
+  if (debugMarketId) {
+    const debugSnapshot = snapshotsToInsert.find(s => s.market_id === debugMarketId);
+    if (debugSnapshot) {
+      console.log('\n========================================');
+      console.log('🔍 DEBUG - Snapshot to be inserted for', debugMarketId);
+      console.log('========================================');
+      console.log('market_id:', debugSnapshot.market_id);
+      console.log('yes_price:', debugSnapshot.yes_price);
+      console.log('volume_usd:', debugSnapshot.volume_usd);
+      console.log('========================================\n');
+    } else {
+      console.log(`\n⚠️  DEBUG - Market ${debugMarketId} NOT found in snapshots (filtered out due to invalid yes_price)\n`);
+    }
   }
 
   console.log(`Inserting ${snapshotsToInsert.length} price snapshots...`);
@@ -365,6 +444,8 @@ export async function createSnapshotsForAllMarkets(): Promise<{
   }
 
   const supabase = createClient(supabaseUrl, supabaseKey);
+
+  const debugMarketId = process.env.DEBUG_MARKET_ID;
 
   console.log('\n=== Creating Snapshots for All Markets ===');
 
@@ -414,6 +495,20 @@ export async function createSnapshotsForAllMarkets(): Promise<{
         volume_usd: m.volume_usd,
         // created_at will default to now() in database
       }));
+
+      // Debug output for specific market in this batch
+      if (debugMarketId) {
+        const debugSnapshot = snapshots.find(s => s.market_id === debugMarketId);
+        if (debugSnapshot) {
+          console.log('\n========================================');
+          console.log('🔍 DEBUG - Snapshot from ALL MARKETS batch for', debugMarketId);
+          console.log('========================================');
+          console.log('market_id:', debugSnapshot.market_id);
+          console.log('yes_price:', debugSnapshot.yes_price);
+          console.log('volume_usd:', debugSnapshot.volume_usd);
+          console.log('========================================\n');
+        }
+      }
 
       // Insert snapshots for this batch
       const { error: insertError } = await supabase
@@ -478,6 +573,12 @@ export function deduplicateMarketsById(markets: MarketRecord[]): MarketRecord[] 
 export async function runIngestion(): Promise<IngestionResult> {
   console.log('=== Polymarket Data Ingestion Starting ===');
 
+  // Check for debug mode
+  const debugMarketId = process.env.DEBUG_MARKET_ID;
+  if (debugMarketId) {
+    console.log(`\n🔍 DEBUG MODE ENABLED for market_id: ${debugMarketId}\n`);
+  }
+
   // Fetch ALL markets from Gamma API (with pagination)
   const gammaMarkets = await fetchFromGammaAPI();
   const fetchedMarketsTotal = gammaMarkets.length;
@@ -522,7 +623,7 @@ export async function runIngestion(): Promise<IngestionResult> {
   }
 
   // Normalize to our format
-  const normalizedMarkets = nonSportsMarkets.map(normalizeMarket);
+  const normalizedMarkets = nonSportsMarkets.map(m => normalizeMarket(m, debugMarketId));
 
   // Count markets with valid yes_price
   const marketsWithPrice = normalizedMarkets.filter(m => m.yes_price !== null);
