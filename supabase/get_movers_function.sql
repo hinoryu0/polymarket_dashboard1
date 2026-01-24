@@ -1,5 +1,6 @@
 -- RPC function to compute market movers efficiently in SQL
 -- This avoids pagination limits and processes ALL snapshots directly in the database
+-- Enforces tolerance to ensure movers reflect actual movement within the requested window
 
 CREATE OR REPLACE FUNCTION get_movers(
   window_minutes INTEGER DEFAULT 1440,
@@ -17,7 +18,18 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SECURITY DEFINER
 AS $$
+DECLARE
+  max_abs_diff_seconds INTEGER;
 BEGIN
+  -- Calculate tolerance based on window size
+  -- Tolerance = time distance allowed between past_time and target_time
+  max_abs_diff_seconds := CASE
+    WHEN window_minutes <= 60 THEN 90 * 60      -- 1h window: ±90 minutes
+    WHEN window_minutes <= 360 THEN 180 * 60    -- 6h window: ±180 minutes (3h)
+    WHEN window_minutes <= 1440 THEN 480 * 60   -- 24h window: ±480 minutes (8h)
+    ELSE (window_minutes * 1.5)::INTEGER * 60   -- Larger windows: 1.5x window
+  END;
+
   RETURN QUERY
   WITH latest_snapshots AS (
     -- Get the most recent snapshot per market
@@ -40,6 +52,7 @@ BEGIN
   ),
   past_snapshots AS (
     -- Find the snapshot closest to target_time for each market
+    -- ONLY include snapshots within tolerance of target_time
     SELECT DISTINCT ON (tt.market_id)
       tt.market_id,
       tt.latest_time,
@@ -52,6 +65,7 @@ BEGIN
     JOIN price_snapshots ps ON ps.market_id = tt.market_id
     WHERE ps.yes_price IS NOT NULL
       AND ps.created_at < tt.latest_time  -- Must be before latest (not the same snapshot)
+      AND ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) <= max_abs_diff_seconds  -- Within tolerance
     ORDER BY tt.market_id, ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) ASC
   )
   SELECT
