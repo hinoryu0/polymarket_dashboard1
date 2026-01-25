@@ -4,9 +4,12 @@
  * Policy: Delete snapshots older than 48 hours to prevent unbounded DB growth.
  *
  * IMPORTANT: This is BEST-EFFORT cleanup. It will NOT fail the workflow.
- * - Uses batched deletes to avoid statement timeouts
+ * - Uses SQL RPC function for reliable batched deletes
  * - Has a hard runtime limit (60 seconds)
  * - Always exits with code 0 (even on errors)
+ *
+ * Requires SQL function: public.delete_old_snapshots_batch(cutoff_ts, batch_size)
+ * See: supabase/delete_old_snapshots.sql
  *
  * Usage:
  *   npm run cleanup-snapshots
@@ -23,18 +26,25 @@ import { createClient } from '@supabase/supabase-js';
 // Configuration
 const RETENTION_HOURS = 48;
 const BATCH_SIZE = 5000; // Delete in batches to avoid timeouts
-const MAX_ITERATIONS = 100; // Safety limit to prevent infinite loops
 const MAX_RUNTIME_MS = 60 * 1000; // Hard stop after 60 seconds
+const BATCH_DELAY_MS = 250; // Delay between batches to reduce load
 
 /**
- * Run the cleanup with batched deletes for safety
+ * Sleep for specified milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Run the cleanup using SQL RPC function
  * Returns normally even on errors (best-effort)
  */
 async function runCleanup(): Promise<void> {
   const startTime = Date.now();
 
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║        SNAPSHOT CLEANUP (BEST-EFFORT)                      ║');
+  console.log('║        SNAPSHOT CLEANUP (BEST-EFFORT via RPC)              ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`Started at: ${new Date().toISOString()}`);
 
@@ -58,6 +68,7 @@ async function runCleanup(): Promise<void> {
   console.log(`  Cutoff: ${cutoffTime}`);
   console.log(`  Batch size: ${BATCH_SIZE}`);
   console.log(`  Max runtime: ${MAX_RUNTIME_MS / 1000}s`);
+  console.log(`  Batch delay: ${BATCH_DELAY_MS}ms`);
 
   let totalDeleted = 0;
   let batches = 0;
@@ -77,10 +88,10 @@ async function runCleanup(): Promise<void> {
       console.log(`\nCould not count rows (non-fatal)`);
     }
 
-    console.log(`\nStarting batched deletion...`);
+    console.log(`\nStarting batched deletion via RPC...`);
 
-    // Batch delete loop
-    for (let i = 0; i < MAX_ITERATIONS; i++) {
+    // Batch delete loop using RPC
+    while (true) {
       // Check runtime limit
       const elapsed = Date.now() - startTime;
       if (elapsed >= MAX_RUNTIME_MS) {
@@ -88,50 +99,50 @@ async function runCleanup(): Promise<void> {
         break;
       }
 
-      // Find IDs of old rows to delete (batch)
-      const { data: oldRows, error: selectError } = await supabase
-        .from('price_snapshots')
-        .select('id')
-        .lt('created_at', cutoffTime)
-        .limit(BATCH_SIZE);
+      // Call RPC function to delete a batch
+      const { data: deletedCount, error: rpcError } = await supabase.rpc(
+        'delete_old_snapshots_batch',
+        {
+          cutoff_ts: cutoffTime,
+          batch_size: BATCH_SIZE,
+        }
+      );
 
-      if (selectError) {
-        console.warn(`⚠️ Select error: ${selectError.message} - stopping cleanup`);
+      if (rpcError) {
+        console.warn(`\n⚠️ RPC error: ${rpcError.message}`);
+        console.warn(`   Code: ${rpcError.code}`);
+        console.warn(`   Details: ${JSON.stringify(rpcError.details || rpcError)}`);
+        console.log(`   Stopping cleanup (best-effort)`);
         break;
       }
 
-      if (!oldRows || oldRows.length === 0) {
+      const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
+
+      if (deleted === 0) {
         console.log(`\n✅ No more rows to delete`);
         break;
       }
 
-      const idsToDelete = oldRows.map((row) => row.id);
-
-      // Delete the batch
-      const { error: deleteError } = await supabase
-        .from('price_snapshots')
-        .delete()
-        .in('id', idsToDelete);
-
-      if (deleteError) {
-        console.warn(`⚠️ Delete error: ${deleteError.message} - stopping cleanup`);
-        break;
-      }
-
-      totalDeleted += idsToDelete.length;
+      totalDeleted += deleted;
       batches++;
 
-      console.log(`  Batch ${batches}: deleted ${idsToDelete.length} rows (total: ${totalDeleted})`);
+      console.log(`  Batch ${batches}: deleted ${deleted} rows (total: ${totalDeleted})`);
 
       // If we got fewer than BATCH_SIZE, we're done
-      if (oldRows.length < BATCH_SIZE) {
+      if (deleted < BATCH_SIZE) {
         console.log(`\n✅ All old rows deleted`);
         break;
       }
+
+      // Small delay between batches to reduce DB load
+      await sleep(BATCH_DELAY_MS);
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.warn(`\n⚠️ Cleanup error (non-fatal): ${errorMessage}`);
+    if (error instanceof Error && error.stack) {
+      console.warn(`   Stack: ${error.stack.split('\n').slice(0, 3).join('\n')}`);
+    }
   }
 
   const durationMs = Date.now() - startTime;
