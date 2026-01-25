@@ -116,7 +116,7 @@ function extractSlug(url: string): string | null {
 async function computeMoversForWindow(
   supabase: AnySupabaseClient,
   config: WindowConfig
-): Promise<{ gainers: MoverCacheItem[]; losers: MoverCacheItem[]; stats: Record<string, number> }> {
+): Promise<{ gainers: MoverCacheItem[]; losers: MoverCacheItem[]; stats: Record<string, number>; rpcError: boolean }> {
   console.log(`\n========== Computing ${config.window_key} movers ==========`);
   console.log(`Window: ${config.window_minutes} minutes, Limit: ${config.limit}`);
 
@@ -132,7 +132,8 @@ async function computeMoversForWindow(
   if (rpcError) {
     console.error(`RPC ERROR: ${rpcError.message}`);
     console.error(`RPC error details:`, JSON.stringify(rpcError, null, 2));
-    return { gainers: [], losers: [], stats: { rpc_error: 1 } };
+    console.log(`⚠️ Skipping cache update for ${config.window_key} - keeping previous cached data intact`);
+    return { gainers: [], losers: [], stats: { rpc_error: 1 }, rpcError: true };
   }
 
   // Debug: Show raw RPC response
@@ -144,8 +145,8 @@ async function computeMoversForWindow(
   console.log(`RPC returned ${rpcRows.length} rows`);
 
   if (rpcRows.length === 0) {
-    console.log('No rows returned from RPC - cache will be empty');
-    return { gainers: [], losers: [], stats };
+    console.log('No rows returned from RPC - cache will be empty (valid case)');
+    return { gainers: [], losers: [], stats, rpcError: false };
   }
 
   // Debug: Show first 3 raw RPC rows
@@ -165,7 +166,7 @@ async function computeMoversForWindow(
 
   if (validRows.length === 0) {
     console.log('No valid rows after change_pp validation');
-    return { gainers: [], losers: [], stats };
+    return { gainers: [], losers: [], stats, rpcError: false };
   }
 
   // Fetch market metadata
@@ -237,7 +238,7 @@ async function computeMoversForWindow(
 
   if (allMovers.length === 0) {
     console.log('No movers after processing');
-    return { gainers: [], losers: [], stats };
+    return { gainers: [], losers: [], stats, rpcError: false };
   }
 
   // Debug: Show first 3 processed movers
@@ -302,7 +303,7 @@ async function computeMoversForWindow(
     }
   }
 
-  return { gainers, losers, stats };
+  return { gainers, losers, stats, rpcError: false };
 }
 
 async function updateCache(
@@ -351,13 +352,26 @@ async function main() {
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
-  const results: Array<{ window: string; gainers: number; losers: number; success: boolean }> = [];
+  const results: Array<{ window: string; gainers: number; losers: number; status: 'updated' | 'skipped_rpc_error' | 'write_failed' | 'exception' }> = [];
 
   for (const config of WINDOW_CONFIGS) {
     try {
       const windowStart = Date.now();
-      const { gainers, losers, stats } = await computeMoversForWindow(supabase, config);
+      const { gainers, losers, stats, rpcError } = await computeMoversForWindow(supabase, config);
 
+      // If RPC error occurred, skip cache update to preserve existing data
+      if (rpcError) {
+        console.log(`\n⏭️ SKIPPING cache update for ${config.window_key} due to RPC error`);
+        results.push({
+          window: config.window_key,
+          gainers: 0,
+          losers: 0,
+          status: 'skipped_rpc_error',
+        });
+        continue;
+      }
+
+      // RPC succeeded (even if empty) - update the cache
       const cacheEntry: CacheEntry = {
         window_key: config.window_key,
         generated_at: new Date().toISOString(),
@@ -380,15 +394,15 @@ async function main() {
         window: config.window_key,
         gainers: gainers.length,
         losers: losers.length,
-        success,
+        status: success ? 'updated' : 'write_failed',
       });
     } catch (error) {
-      console.error(`\n❌ ERROR computing ${config.window_key}:`, error);
+      console.error(`\n❌ EXCEPTION computing ${config.window_key}:`, error);
       results.push({
         window: config.window_key,
         gainers: 0,
         losers: 0,
-        success: false,
+        status: 'exception',
       });
     }
   }
@@ -399,16 +413,59 @@ async function main() {
   console.log('║                    FINAL SUMMARY                           ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`Total duration: ${totalDuration}ms (${(totalDuration / 1000).toFixed(2)}s)`);
-  console.log('\nResults per window:');
-  for (const r of results) {
-    const status = r.success ? '✅' : '❌';
-    console.log(`  ${status} ${r.window}: ${r.gainers} gainers, ${r.losers} losers`);
+
+  // Count by status
+  const updated = results.filter(r => r.status === 'updated');
+  const skippedRpc = results.filter(r => r.status === 'skipped_rpc_error');
+  const writeFailed = results.filter(r => r.status === 'write_failed');
+  const exceptions = results.filter(r => r.status === 'exception');
+
+  console.log('\n📊 Summary:');
+  console.log(`  ✅ Successfully updated: ${updated.length}/${results.length} windows`);
+  if (skippedRpc.length > 0) {
+    console.log(`  ⏭️ Skipped (RPC timeout/error): ${skippedRpc.length} windows (previous cache preserved)`);
+  }
+  if (writeFailed.length > 0) {
+    console.log(`  ❌ Write failed: ${writeFailed.length} windows`);
+  }
+  if (exceptions.length > 0) {
+    console.log(`  💥 Exceptions: ${exceptions.length} windows`);
   }
 
-  // Exit with error if all windows failed
-  const anySuccess = results.some(r => r.success && (r.gainers > 0 || r.losers > 0));
-  if (!anySuccess) {
-    console.log('\n⚠️ WARNING: No movers were cached for any window!');
+  console.log('\nResults per window:');
+  for (const r of results) {
+    let icon: string;
+    let detail: string;
+    switch (r.status) {
+      case 'updated':
+        icon = '✅';
+        detail = `${r.gainers} gainers, ${r.losers} losers`;
+        break;
+      case 'skipped_rpc_error':
+        icon = '⏭️';
+        detail = 'SKIPPED - RPC error (previous cache preserved)';
+        break;
+      case 'write_failed':
+        icon = '❌';
+        detail = 'cache write failed';
+        break;
+      case 'exception':
+        icon = '💥';
+        detail = 'exception occurred';
+        break;
+    }
+    console.log(`  ${icon} ${r.window}: ${detail}`);
+  }
+
+  // Final status message
+  if (updated.length === results.length) {
+    console.log('\n🎉 All windows updated successfully!');
+  } else if (updated.length > 0) {
+    console.log(`\n⚠️ Partial success: ${updated.length}/${results.length} windows updated`);
+  } else if (skippedRpc.length === results.length) {
+    console.log('\n⚠️ All windows skipped due to RPC errors - previous cache data preserved');
+  } else {
+    console.log('\n❌ No windows were updated successfully');
   }
 
   process.exit(0);
