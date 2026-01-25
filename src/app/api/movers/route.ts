@@ -38,11 +38,44 @@ type RpcMoverRow = {
 const MIN_PRICE = 0.05; // 5%
 const MAX_PRICE = 0.95; // 95%
 
+// Sports keywords to filter out - these markets add noise to movers
+const SPORTS_KEYWORDS = [
+  // Leagues and competitions
+  'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
+  'nba', 'nfl', 'mlb', 'nhl', 'ufc', 'mls', 'epl', 'ucl',
+  'world cup', 'euro 2024', 'copa america',
+  // Teams (common ones)
+  'chelsea', 'arsenal', 'liverpool', 'man city', 'manchester', 'tottenham',
+  'barcelona', 'real madrid', 'bayern', 'juventus', 'psg', 'inter milan',
+  'lakers', 'celtics', 'warriors', 'bulls', 'knicks', 'nets',
+  'chiefs', 'eagles', 'cowboys', 'patriots', '49ers',
+  'yankees', 'dodgers', 'red sox', 'cubs', 'mets',
+  // Generic sports terms
+  'vs.', 'vs ', ' vs ', 'match', 'game ', 'win ', 'score', 'goals',
+  'touchdown', 'playoff', 'finals', 'championship', 'mvp',
+  'betting', 'spread', 'over/under', 'moneyline',
+];
+
+/**
+ * Check if a market looks like a sports market based on title/slug
+ * @param title - Market title
+ * @param slug - Market slug (optional)
+ * @returns true if this appears to be a sports market
+ */
+function isSportsMarket(title: string, slug: string | null): boolean {
+  const textToCheck = `${title} ${slug || ''}`.toLowerCase();
+  return SPORTS_KEYWORDS.some(keyword => textToCheck.includes(keyword.toLowerCase()));
+}
+
 /**
  * GET /api/movers
  * Returns top gainers/losers based on price changes over time window
  * Uses SQL RPC function for efficient processing across entire price_snapshots table
- * Filters: Excludes markets with latest price < 5% or > 95% (already decided)
+ *
+ * Filters applied:
+ * - Volume: Window-dependent minimum ($1k/1h, $5k/6h, $15k/24h) - applied in SQL
+ * - Price range: 5-95% (excludes "already decided" markets) - SQL + backup in JS
+ * - Sports: Excludes sports markets by keyword matching on title/slug - JS filter
  */
 export async function GET(request: Request) {
   try {
@@ -153,7 +186,9 @@ export async function GET(request: Request) {
       .filter((m): m is MoverData => m !== null)
       // Filter out "already decided" markets (price < 5% or > 95%)
       // This is a backup filter in case SQL function doesn't have the filter applied
-      .filter((m) => m.latest_price >= MIN_PRICE && m.latest_price <= MAX_PRICE);
+      .filter((m) => m.latest_price >= MIN_PRICE && m.latest_price <= MAX_PRICE)
+      // Filter out sports markets to reduce noise
+      .filter((m) => !isSportsMarket(m.title, m.slug));
 
     // Split into gainers and losers, then limit
     const topGainers = movers
@@ -168,7 +203,7 @@ export async function GET(request: Request) {
 
     console.log(
       `Movers computed (SQL RPC) for window=${window}: ` +
-      `${movers.length} total (5-95% filter applied), ${topGainers.length} gainers, ${topLosers.length} losers`
+      `${movers.length} total (volume+price+sports filters), ${topGainers.length} gainers, ${topLosers.length} losers`
     );
 
     return NextResponse.json({
