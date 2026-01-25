@@ -16,7 +16,11 @@
  *   SUPABASE_SERVICE_ROLE_KEY - Service role key (for write access)
  */
 
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+// Use a generic Supabase client type to avoid strict schema inference issues
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnySupabaseClient = SupabaseClient<any, any, any>;
 
 // ============================================================================
 // Configuration
@@ -132,7 +136,7 @@ function extractSlug(url: string): string | null {
 // ============================================================================
 
 async function computeMoversForWindow(
-  supabase: ReturnType<typeof createClient>,
+  supabase: AnySupabaseClient,
   config: WindowConfig
 ): Promise<{ gainers: MoverData[]; losers: MoverData[]; stats: { snapshotsFetched: number; marketsProcessed: number } }> {
   const now = new Date();
@@ -205,8 +209,10 @@ async function computeMoversForWindow(
       continue;
     }
 
-    for (const m of markets || []) {
-      marketMap.set(m.id, m as Market);
+    // Explicitly type the markets array to avoid TypeScript 'never' inference
+    const safeMarkets = (markets ?? []) as Market[];
+    for (const m of safeMarkets) {
+      marketMap.set(m.id, m);
     }
   }
 
@@ -215,7 +221,7 @@ async function computeMoversForWindow(
   // Compute movers
   const movers: MoverData[] = [];
 
-  for (const [marketId, snapshots] of snapshotsByMarket) {
+  for (const [marketId, snapshots] of Array.from(snapshotsByMarket.entries())) {
     const market = marketMap.get(marketId);
     if (!market) continue;
 
@@ -305,7 +311,7 @@ async function computeMoversForWindow(
 }
 
 async function updateCache(
-  supabase: ReturnType<typeof createClient>,
+  supabase: AnySupabaseClient,
   entry: CacheEntry
 ): Promise<void> {
   const { error } = await supabase
