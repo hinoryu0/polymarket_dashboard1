@@ -34,10 +34,15 @@ type RpcMoverRow = {
   delta_minutes: number;
 };
 
+// Price range filter: exclude markets that are "already decided" (near 0 or 1)
+const MIN_PRICE = 0.05; // 5%
+const MAX_PRICE = 0.95; // 95%
+
 /**
  * GET /api/movers
  * Returns top gainers/losers based on price changes over time window
  * Uses SQL RPC function for efficient processing across entire price_snapshots table
+ * Filters: Excludes markets with latest price < 5% or > 95% (already decided)
  */
 export async function GET(request: Request) {
   try {
@@ -145,7 +150,10 @@ export async function GET(request: Request) {
           delta_minutes: row.delta_minutes,
         };
       })
-      .filter((m): m is MoverData => m !== null);
+      .filter((m): m is MoverData => m !== null)
+      // Filter out "already decided" markets (price < 5% or > 95%)
+      // This is a backup filter in case SQL function doesn't have the filter applied
+      .filter((m) => m.latest_price >= MIN_PRICE && m.latest_price <= MAX_PRICE);
 
     // Split into gainers and losers, then limit
     const topGainers = movers
@@ -160,7 +168,7 @@ export async function GET(request: Request) {
 
     console.log(
       `Movers computed (SQL RPC) for window=${window}: ` +
-      `${movers.length} total, ${topGainers.length} gainers, ${topLosers.length} losers`
+      `${movers.length} total (5-95% filter applied), ${topGainers.length} gainers, ${topLosers.length} losers`
     );
 
     return NextResponse.json({

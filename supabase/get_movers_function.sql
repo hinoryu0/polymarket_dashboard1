@@ -1,6 +1,7 @@
 -- RPC function to compute market movers efficiently in SQL
 -- This avoids pagination limits and processes ALL snapshots directly in the database
 -- Enforces tolerance to ensure movers reflect actual movement within the requested window
+-- Filters: Excludes markets with latest price < 5% or > 95% (already decided)
 
 CREATE OR REPLACE FUNCTION get_movers(
   window_minutes INTEGER DEFAULT 1440,
@@ -79,6 +80,7 @@ BEGIN
   FROM past_snapshots ps
   WHERE ps.yes_past IS NOT NULL
     AND ps.yes_past > 0  -- Avoid divide by zero
+    AND ps.yes_now BETWEEN 0.05 AND 0.95  -- Exclude "already decided" markets (5-95% filter)
   ORDER BY change_pp DESC;  -- Return all, client will split into gainers/losers
 END;
 $$;
