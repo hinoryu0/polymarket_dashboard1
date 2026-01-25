@@ -19,7 +19,7 @@ type MoverData = {
 };
 
 type CacheRow = {
-  window: string;
+  window_key: string;  // DB column name (window is reserved in Postgres)
   generated_at: string;
   params: Record<string, unknown>;
   top_gainers: MoverData[];
@@ -76,11 +76,11 @@ export async function GET(request: Request) {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Read from movers_cache
+    // Read from movers_cache (window_key is the DB column, window is reserved in Postgres)
     const { data: cacheData, error: cacheError } = await supabase
       .from('movers_cache')
       .select('*')
-      .eq('window', window)
+      .eq('window_key', window)
       .single();
 
     if (cacheError) {

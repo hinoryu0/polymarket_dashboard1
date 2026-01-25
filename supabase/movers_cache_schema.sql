@@ -3,8 +3,9 @@
 -- Updated periodically by GitHub Actions workflow (every 15 minutes)
 
 -- Create the movers_cache table
+-- Note: Using window_key instead of window because "window" is a reserved word in Postgres
 CREATE TABLE IF NOT EXISTS public.movers_cache (
-  window TEXT PRIMARY KEY,                          -- '1h', '6h', '24h'
+  window_key TEXT PRIMARY KEY,                      -- '1h', '6h', '24h'
   generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- When cache was computed
   params JSONB NOT NULL DEFAULT '{}'::JSONB,        -- Computation parameters (filters, thresholds)
   top_gainers JSONB NOT NULL DEFAULT '[]'::JSONB,   -- Array of top gainers
@@ -28,8 +29,8 @@ GRANT INSERT, UPDATE, DELETE ON public.movers_cache TO service_role;
 COMMENT ON TABLE public.movers_cache IS
   'Pre-computed movers cache to avoid expensive RPC calls. Updated every 15 minutes by GitHub Actions.';
 
-COMMENT ON COLUMN public.movers_cache.window IS
-  'Time window: 1h, 6h, or 24h';
+COMMENT ON COLUMN public.movers_cache.window_key IS
+  'Time window: 1h, 6h, or 24h (named window_key because window is reserved in Postgres)';
 
 COMMENT ON COLUMN public.movers_cache.params IS
   'JSON object with computation parameters: { min_volume, min_change_pp, price_range, etc. }';
