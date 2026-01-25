@@ -38,6 +38,9 @@ type RpcMoverRow = {
 const MIN_PRICE = 0.05; // 5%
 const MAX_PRICE = 0.95; // 95%
 
+// Big moves filter: only show significant price movements
+const MIN_CHANGE_PP = 10; // Minimum 10 percentage points change
+
 // Sports keywords to filter out - these markets add noise to movers
 const SPORTS_KEYWORDS = [
   // Leagues and competitions
@@ -73,6 +76,7 @@ function isSportsMarket(title: string, slug: string | null): boolean {
  * Uses SQL RPC function for efficient processing across entire price_snapshots table
  *
  * Filters applied:
+ * - Big moves: abs(change_pp) >= 10 (at least 10pp movement) - SQL + backup in JS
  * - Volume: Window-dependent minimum ($1k/1h, $5k/6h, $15k/24h) - applied in SQL
  * - Price range: 5-95% (excludes "already decided" markets) - SQL + backup in JS
  * - Sports: Excludes sports markets by keyword matching on title/slug - JS filter
@@ -188,7 +192,10 @@ export async function GET(request: Request) {
       // This is a backup filter in case SQL function doesn't have the filter applied
       .filter((m) => m.latest_price >= MIN_PRICE && m.latest_price <= MAX_PRICE)
       // Filter out sports markets to reduce noise
-      .filter((m) => !isSportsMarket(m.title, m.slug));
+      .filter((m) => !isSportsMarket(m.title, m.slug))
+      // Big moves only: at least 10 percentage points change
+      // This is a backup filter in case SQL function doesn't have the filter applied
+      .filter((m) => Math.abs(m.change_pp) >= MIN_CHANGE_PP);
 
     // Split into gainers and losers, then limit
     const topGainers = movers
@@ -203,7 +210,7 @@ export async function GET(request: Request) {
 
     console.log(
       `Movers computed (SQL RPC) for window=${window}: ` +
-      `${movers.length} total (volume+price+sports filters), ${topGainers.length} gainers, ${topLosers.length} losers`
+      `${movers.length} total (>=10pp, volume, price, sports filters), ${topGainers.length} gainers, ${topLosers.length} losers`
     );
 
     return NextResponse.json({
