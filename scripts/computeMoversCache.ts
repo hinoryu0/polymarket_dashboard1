@@ -1,8 +1,17 @@
 /**
- * Compute Movers Cache Script
+ * Compute Movers Cache Script (NO RPC VERSION)
  *
- * Calls the optimized get_movers() RPC function and stores results in movers_cache table.
- * The RPC function only scans last 48 hours of snapshots (matching retention policy).
+ * Computes movers directly in Node.js by querying price_snapshots table.
+ * Does NOT use the get_movers() RPC function (avoids Supabase Free plan timeouts).
+ *
+ * Algorithm:
+ * 1. Fetch latest snapshots (last 3 hours) -> reduce to one per market
+ * 2. Fetch past snapshots (window + 6 hours) -> find closest to target_time per market
+ * 3. Calculate change_pp, apply filters
+ * 4. Enrich with market metadata
+ * 5. Apply category exclusion
+ * 6. Sort and slice to top 20 gainers/losers
+ * 7. Upsert to movers_cache
  *
  * Run by GitHub Actions every 15 minutes after snapshot ingestion.
  *
@@ -29,17 +38,24 @@ type AnySupabaseClient = SupabaseClient<any, any, any>;
 type WindowConfig = {
   window_key: string;
   window_minutes: number;
+  min_volume_usd: number;
   limit: number;
 };
 
 const WINDOW_CONFIGS: WindowConfig[] = [
-  { window_key: '1h', window_minutes: 60, limit: 20 },
-  { window_key: '6h', window_minutes: 360, limit: 20 },
-  { window_key: '24h', window_minutes: 1440, limit: 20 },
+  { window_key: '1h', window_minutes: 60, min_volume_usd: 1000, limit: 20 },
+  { window_key: '6h', window_minutes: 360, min_volume_usd: 5000, limit: 20 },
+  { window_key: '24h', window_minutes: 1440, min_volume_usd: 15000, limit: 20 },
 ];
 
-// Sports/entertainment keywords to filter out
-// NOTE: Only specific league/team names - NO generic words like "vs", "match", "game", "score"
+// Price range filter: only show markets not "already decided"
+const MIN_PRICE = 0.05;
+const MAX_PRICE = 0.95;
+
+// Big moves only: at least 10 percentage points
+const MIN_CHANGE_PP = 10;
+
+// Sports/entertainment keywords to filter out (ONLY specific league/team names)
 const EXCLUDED_KEYWORDS = [
   // Leagues only
   'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
@@ -53,14 +69,11 @@ const EXCLUDED_KEYWORDS = [
 // Types
 // ============================================================================
 
-type RpcMoverRow = {
+type Snapshot = {
   market_id: string;
-  latest_time: string;
-  past_time: string;
-  yes_now: number;
-  yes_past: number;
-  change_pp: number;
-  delta_minutes: number;
+  created_at: string;
+  yes_price: number;
+  volume_usd: number | null;
 };
 
 type Market = {
@@ -70,7 +83,17 @@ type Market = {
   volume_usd: number | null;
 };
 
-// Minimal mover data for cache storage
+type MoverCandidate = {
+  market_id: string;
+  latest_time: Date;
+  past_time: Date;
+  yes_now: number;
+  yes_past: number;
+  change_pp: number;
+  delta_minutes: number;
+  volume_usd: number;
+};
+
 type MoverCacheItem = {
   market_id: string;
   title: string;
@@ -92,6 +115,13 @@ type CacheEntry = {
   top_losers: MoverCacheItem[];
 };
 
+type ComputeResult = {
+  gainers: MoverCacheItem[];
+  losers: MoverCacheItem[];
+  stats: Record<string, number>;
+  error: boolean;
+};
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -110,221 +140,381 @@ function extractSlug(url: string): string | null {
 }
 
 // ============================================================================
+// Data Fetching Functions
+// ============================================================================
+
+/**
+ * Fetch latest snapshot per market (within last 3 hours)
+ */
+async function fetchLatestSnapshots(
+  supabase: AnySupabaseClient
+): Promise<{ snapshots: Map<string, Snapshot>; error: boolean }> {
+  const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+
+  console.log(`  Fetching snapshots since ${threeHoursAgo}...`);
+
+  const { data, error } = await supabase
+    .from('price_snapshots')
+    .select('market_id, created_at, yes_price, volume_usd')
+    .gt('created_at', threeHoursAgo)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error(`  ERROR fetching latest snapshots: ${error.message}`);
+    return { snapshots: new Map(), error: true };
+  }
+
+  const rows = (data || []) as Snapshot[];
+  console.log(`  Fetched ${rows.length} snapshots from last 3 hours`);
+
+  // Reduce to latest per market
+  const latestMap = new Map<string, Snapshot>();
+  for (const row of rows) {
+    if (!latestMap.has(row.market_id)) {
+      latestMap.set(row.market_id, row);
+    }
+  }
+
+  console.log(`  Unique markets with latest snapshot: ${latestMap.size}`);
+  return { snapshots: latestMap, error: false };
+}
+
+/**
+ * Fetch past snapshots for finding historical prices
+ * Query snapshots within (window_minutes + 360) minutes to have enough data
+ */
+async function fetchPastSnapshots(
+  supabase: AnySupabaseClient,
+  windowMinutes: number
+): Promise<{ snapshots: Snapshot[]; error: boolean }> {
+  // Fetch snapshots from window_minutes + 6 hours ago to have enough range
+  const lookbackMinutes = windowMinutes + 360;
+  const cutoffTime = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
+
+  console.log(`  Fetching past snapshots since ${cutoffTime} (${lookbackMinutes} min lookback)...`);
+
+  const { data, error } = await supabase
+    .from('price_snapshots')
+    .select('market_id, created_at, yes_price')
+    .gt('created_at', cutoffTime)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.error(`  ERROR fetching past snapshots: ${error.message}`);
+    return { snapshots: [], error: true };
+  }
+
+  const rows = (data || []) as Snapshot[];
+  console.log(`  Fetched ${rows.length} past snapshot candidates`);
+  return { snapshots: rows, error: false };
+}
+
+/**
+ * Find the past snapshot closest to target_time for each market
+ */
+function findPastSnapshotsForMarkets(
+  latestMap: Map<string, Snapshot>,
+  pastSnapshots: Snapshot[],
+  windowMinutes: number
+): Map<string, Snapshot> {
+  const pastMap = new Map<string, Snapshot>();
+
+  // Group past snapshots by market_id
+  const pastByMarket = new Map<string, Snapshot[]>();
+  for (const snap of pastSnapshots) {
+    const existing = pastByMarket.get(snap.market_id) || [];
+    existing.push(snap);
+    pastByMarket.set(snap.market_id, existing);
+  }
+
+  // For each market with a latest snapshot, find the best past snapshot
+  for (const [marketId, latestSnap] of Array.from(latestMap.entries())) {
+    const latestTime = new Date(latestSnap.created_at).getTime();
+    const targetTime = latestTime - windowMinutes * 60 * 1000;
+
+    const candidates = pastByMarket.get(marketId) || [];
+
+    let bestSnap: Snapshot | null = null;
+    let bestDiff = Infinity;
+
+    for (const snap of candidates) {
+      const snapTime = new Date(snap.created_at).getTime();
+
+      // Must be before latest time
+      if (snapTime >= latestTime) continue;
+
+      const diff = Math.abs(snapTime - targetTime);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestSnap = snap;
+      }
+    }
+
+    if (bestSnap) {
+      pastMap.set(marketId, bestSnap);
+    }
+  }
+
+  return pastMap;
+}
+
+/**
+ * Fetch market metadata in batches
+ */
+async function fetchMarketMetadata(
+  supabase: AnySupabaseClient,
+  marketIds: string[]
+): Promise<{ markets: Map<string, Market>; error: boolean }> {
+  if (marketIds.length === 0) {
+    return { markets: new Map(), error: false };
+  }
+
+  console.log(`  Fetching metadata for ${marketIds.length} markets...`);
+
+  const marketMap = new Map<string, Market>();
+  const batchSize = 500; // Safe batch size for Supabase
+
+  for (let i = 0; i < marketIds.length; i += batchSize) {
+    const batch = marketIds.slice(i, i + batchSize);
+
+    const { data, error } = await supabase
+      .from('markets')
+      .select('id, title, url, volume_usd')
+      .in('id', batch);
+
+    if (error) {
+      console.error(`  ERROR fetching market metadata batch ${i}: ${error.message}`);
+      return { markets: new Map(), error: true };
+    }
+
+    const rows = (data || []) as Market[];
+    for (const m of rows) {
+      marketMap.set(m.id, m);
+    }
+  }
+
+  console.log(`  Fetched metadata for ${marketMap.size} markets`);
+  return { markets: marketMap, error: false };
+}
+
+// ============================================================================
 // Main Computation Logic
 // ============================================================================
 
 async function computeMoversForWindow(
   supabase: AnySupabaseClient,
   config: WindowConfig
-): Promise<{ gainers: MoverCacheItem[]; losers: MoverCacheItem[]; stats: Record<string, number>; rpcError: boolean }> {
+): Promise<ComputeResult> {
   console.log(`\n========== Computing ${config.window_key} movers ==========`);
-  console.log(`Window: ${config.window_minutes} minutes, Limit: ${config.limit}`);
+  console.log(`Window: ${config.window_minutes} min, Volume threshold: $${config.min_volume_usd}, Limit: ${config.limit}`);
 
   const stats: Record<string, number> = {};
 
-  // Call RPC function
-  console.log(`Calling RPC get_movers(${config.window_minutes}, ${config.limit * 5})...`);
-  const { data: rpcData, error: rpcError } = await supabase.rpc('get_movers', {
-    window_minutes: config.window_minutes,
-    limit_n: config.limit * 5,  // Get extra to allow for filtering
-  });
+  // Step 1: Fetch latest snapshots
+  console.log('\n[Step 1] Fetching latest snapshots...');
+  const { snapshots: latestMap, error: latestError } = await fetchLatestSnapshots(supabase);
+  if (latestError) {
+    return { gainers: [], losers: [], stats: { fetch_latest_error: 1 }, error: true };
+  }
+  stats.latest_markets = latestMap.size;
 
-  if (rpcError) {
-    console.error(`RPC ERROR: ${rpcError.message}`);
-    console.error(`RPC error details:`, JSON.stringify(rpcError, null, 2));
-    console.log(`⚠️ Skipping cache update for ${config.window_key} - keeping previous cached data intact`);
-    return { gainers: [], losers: [], stats: { rpc_error: 1 }, rpcError: true };
+  if (latestMap.size === 0) {
+    console.log('  No latest snapshots found - cache will be empty');
+    return { gainers: [], losers: [], stats, error: false };
   }
 
-  // Debug: Show raw RPC response
-  console.log(`RPC response type: ${typeof rpcData}`);
-  console.log(`RPC response is array: ${Array.isArray(rpcData)}`);
-
-  const rpcRows: RpcMoverRow[] = Array.isArray(rpcData) ? rpcData : [];
-  stats.rpc_total = rpcRows.length;
-  console.log(`RPC returned ${rpcRows.length} rows`);
-
-  if (rpcRows.length === 0) {
-    console.log('No rows returned from RPC - cache will be empty (valid case)');
-    return { gainers: [], losers: [], stats, rpcError: false };
+  // Step 2: Fetch past snapshots
+  console.log('\n[Step 2] Fetching past snapshots...');
+  const { snapshots: pastSnapshots, error: pastError } = await fetchPastSnapshots(supabase, config.window_minutes);
+  if (pastError) {
+    return { gainers: [], losers: [], stats: { fetch_past_error: 1 }, error: true };
   }
+  stats.past_snapshot_candidates = pastSnapshots.length;
 
-  // Debug: Show first 3 raw RPC rows
-  console.log('\nFirst 3 raw RPC rows:');
-  for (let i = 0; i < Math.min(3, rpcRows.length); i++) {
-    const row = rpcRows[i];
-    console.log(`  [${i}] market_id=${row.market_id}, change_pp=${row.change_pp}, yes_now=${row.yes_now}, yes_past=${row.yes_past}`);
-  }
+  // Step 3: Match past snapshots to target times
+  console.log('\n[Step 3] Finding best past snapshot per market...');
+  const pastMap = findPastSnapshotsForMarkets(latestMap, pastSnapshots, config.window_minutes);
+  stats.markets_with_past = pastMap.size;
+  console.log(`  Found past snapshots for ${pastMap.size} markets`);
 
-  // Filter rows with valid numeric change_pp
-  const validRows = rpcRows.filter(row => {
-    const cp = Number(row.change_pp);
-    return Number.isFinite(cp);
-  });
-  stats.valid_change_pp = validRows.length;
-  console.log(`\nRows with valid numeric change_pp: ${validRows.length}`);
+  // Step 4: Calculate movers and apply filters
+  console.log('\n[Step 4] Calculating movers and applying filters...');
+  const candidates: MoverCandidate[] = [];
+  let filteredByPrice = 0;
+  let filteredByChange = 0;
+  let filteredByVolume = 0;
+  let filteredByNullPrice = 0;
 
-  if (validRows.length === 0) {
-    console.log('No valid rows after change_pp validation');
-    return { gainers: [], losers: [], stats, rpcError: false };
-  }
+  for (const [marketId, latestSnap] of Array.from(latestMap.entries())) {
+    const pastSnap = pastMap.get(marketId);
+    if (!pastSnap) continue;
 
-  // Fetch market metadata
-  const marketIds = validRows.map(row => row.market_id);
-  console.log(`Fetching metadata for ${marketIds.length} markets...`);
+    const yesNow = latestSnap.yes_price;
+    const yesPast = pastSnap.yes_price;
+    const volumeUsd = latestSnap.volume_usd ?? 0;
 
-  const { data: markets, error: marketsError } = await supabase
-    .from('markets')
-    .select('id, title, url, volume_usd')
-    .in('id', marketIds);
-
-  if (marketsError) {
-    console.error(`Markets fetch error: ${marketsError.message}`);
-    // Continue without market metadata - use defaults
-  }
-
-  const safeMarkets = (markets ?? []) as Market[];
-  const marketMap = new Map<string, Market>();
-  for (const m of safeMarkets) {
-    marketMap.set(m.id, m);
-  }
-  stats.markets_found = marketMap.size;
-  console.log(`Markets with metadata: ${marketMap.size}`);
-
-  // Debug: Show first 5 market titles BEFORE any filtering
-  console.log('\nFirst 5 market titles (before filtering):');
-  const sampleMarkets = safeMarkets.slice(0, 5);
-  for (let i = 0; i < sampleMarkets.length; i++) {
-    console.log(`  [${i}] "${sampleMarkets[i].title}"`);
-  }
-
-  // Transform to MoverCacheItem, applying minimal filtering
-  const allMovers: MoverCacheItem[] = [];
-  let excludedCount = 0;
-
-  for (const row of validRows) {
-    const market = marketMap.get(row.market_id);
-    const title = market?.title || `Market ${row.market_id.slice(0, 8)}`;
-
-    // Optional: Skip sports (but don't be too aggressive)
-    if (market && isExcludedMarket(market.title)) {
-      excludedCount++;
+    // Filter: null prices
+    if (yesNow == null || yesPast == null) {
+      filteredByNullPrice++;
       continue;
     }
 
-    const cp = Number(row.change_pp);
-    const yesNow = Number(row.yes_now);
-    const yesPast = Number(row.yes_past);
+    // Filter: price range (not already decided)
+    if (yesNow < MIN_PRICE || yesNow > MAX_PRICE) {
+      filteredByPrice++;
+      continue;
+    }
 
-    allMovers.push({
-      market_id: row.market_id,
-      title: title,
-      slug: market ? extractSlug(market.url) : null,
-      volume_usd: market?.volume_usd ?? 0,
-      latest_price: yesNow,
-      past_price: yesPast,
-      change_pp: cp,
-      latest_time: row.latest_time,
-      past_time: row.past_time,
-      delta_minutes: Number(row.delta_minutes) || 0,
+    // Calculate change
+    const changePp = (yesNow - yesPast) * 100;
+
+    // Filter: big moves only
+    if (Math.abs(changePp) < MIN_CHANGE_PP) {
+      filteredByChange++;
+      continue;
+    }
+
+    // Filter: volume threshold
+    if (volumeUsd < config.min_volume_usd) {
+      filteredByVolume++;
+      continue;
+    }
+
+    const latestTime = new Date(latestSnap.created_at);
+    const pastTime = new Date(pastSnap.created_at);
+    const deltaMinutes = Math.round((latestTime.getTime() - pastTime.getTime()) / 60000);
+
+    candidates.push({
+      market_id: marketId,
+      latest_time: latestTime,
+      past_time: pastTime,
+      yes_now: yesNow,
+      yes_past: yesPast,
+      change_pp: changePp,
+      delta_minutes: deltaMinutes,
+      volume_usd: volumeUsd,
     });
   }
 
-  stats.excluded_sports = excludedCount;
-  stats.movers_total = allMovers.length;
-  console.log(`\nMovers after processing: ${allMovers.length}`);
-  console.log(`  - Excluded by sports filter: ${excludedCount}`);
-  console.log(`  - Kept: ${allMovers.length}`);
+  stats.filtered_by_null_price = filteredByNullPrice;
+  stats.filtered_by_price_range = filteredByPrice;
+  stats.filtered_by_change = filteredByChange;
+  stats.filtered_by_volume = filteredByVolume;
+  stats.candidates_after_filters = candidates.length;
 
-  if (allMovers.length === 0) {
-    console.log('No movers after processing');
-    return { gainers: [], losers: [], stats, rpcError: false };
+  console.log(`  Candidates after filters: ${candidates.length}`);
+  console.log(`    - Filtered by null price: ${filteredByNullPrice}`);
+  console.log(`    - Filtered by price range (${MIN_PRICE}-${MAX_PRICE}): ${filteredByPrice}`);
+  console.log(`    - Filtered by change (<${MIN_CHANGE_PP}pp): ${filteredByChange}`);
+  console.log(`    - Filtered by volume (<$${config.min_volume_usd}): ${filteredByVolume}`);
+
+  if (candidates.length === 0) {
+    console.log('  No candidates after filtering - cache will be empty');
+    return { gainers: [], losers: [], stats, error: false };
   }
 
-  // Debug: Show first 3 processed movers
-  console.log('\nFirst 3 processed movers:');
-  for (let i = 0; i < Math.min(3, allMovers.length); i++) {
-    const m = allMovers[i];
-    console.log(`  [${i}] ${m.market_id.slice(0, 8)}... change_pp=${m.change_pp.toFixed(2)}, yes_now=${m.latest_price.toFixed(3)}, yes_past=${m.past_price.toFixed(3)}`);
+  // Step 5: Fetch market metadata
+  console.log('\n[Step 5] Fetching market metadata...');
+  const marketIds = candidates.map(c => c.market_id);
+  const { markets: marketMap, error: marketError } = await fetchMarketMetadata(supabase, marketIds);
+  if (marketError) {
+    return { gainers: [], losers: [], stats: { fetch_metadata_error: 1 }, error: true };
+  }
+  stats.markets_with_metadata = marketMap.size;
+
+  // Step 6: Apply category exclusion and build final movers
+  console.log('\n[Step 6] Applying category filter and building movers...');
+  const movers: MoverCacheItem[] = [];
+  let excludedByCategory = 0;
+
+  for (const c of candidates) {
+    const market = marketMap.get(c.market_id);
+    const title = market?.title || `Market ${c.market_id.slice(0, 8)}`;
+
+    // Category filter
+    if (market && isExcludedMarket(market.title)) {
+      excludedByCategory++;
+      continue;
+    }
+
+    movers.push({
+      market_id: c.market_id,
+      title: title,
+      slug: market ? extractSlug(market.url) : null,
+      volume_usd: c.volume_usd,
+      latest_price: c.yes_now,
+      past_price: c.yes_past,
+      change_pp: c.change_pp,
+      latest_time: c.latest_time.toISOString(),
+      past_time: c.past_time.toISOString(),
+      delta_minutes: c.delta_minutes,
+    });
   }
 
-  // Count gainers and losers
-  const gainersAll = allMovers.filter(m => m.change_pp > 0);
-  const losersAll = allMovers.filter(m => m.change_pp < 0);
-  stats.gainers_count = gainersAll.length;
-  stats.losers_count = losersAll.length;
-  console.log(`\nGainers (change_pp > 0): ${gainersAll.length}`);
-  console.log(`Losers (change_pp < 0): ${losersAll.length}`);
+  stats.excluded_by_category = excludedByCategory;
+  stats.movers_total = movers.length;
+  console.log(`  Excluded by category filter: ${excludedByCategory}`);
+  console.log(`  Final movers: ${movers.length}`);
 
-  // Sort and slice
-  let gainers = gainersAll
+  if (movers.length === 0) {
+    console.log('  No movers after category filter - cache will be empty');
+    return { gainers: [], losers: [], stats, error: false };
+  }
+
+  // Step 7: Sort and slice
+  console.log('\n[Step 7] Sorting and slicing to top movers...');
+  const gainers = movers
+    .filter(m => m.change_pp > 0)
     .sort((a, b) => b.change_pp - a.change_pp)
     .slice(0, config.limit);
 
-  let losers = losersAll
+  const losers = movers
+    .filter(m => m.change_pp < 0)
     .sort((a, b) => a.change_pp - b.change_pp)
     .slice(0, config.limit);
-
-  // FALLBACK: If both empty but movers exist, use abs(change_pp) top movers
-  if (gainers.length === 0 && losers.length === 0 && allMovers.length > 0) {
-    console.log('\n⚠️ FALLBACK: Using top movers by ABS(change_pp)');
-    const topByAbs = allMovers
-      .sort((a, b) => Math.abs(b.change_pp) - Math.abs(a.change_pp))
-      .slice(0, config.limit * 2);
-
-    gainers = topByAbs.filter(m => m.change_pp > 0).slice(0, config.limit);
-    losers = topByAbs.filter(m => m.change_pp < 0).slice(0, config.limit);
-
-    // If still no losers but have positive movers, just show gainers
-    if (losers.length === 0 && gainers.length === 0) {
-      // Put all in gainers as a last resort
-      gainers = topByAbs.slice(0, config.limit);
-    }
-  }
 
   stats.final_gainers = gainers.length;
   stats.final_losers = losers.length;
 
-  console.log(`\nFinal arrays: ${gainers.length} gainers, ${losers.length} losers`);
+  console.log(`  Top gainers: ${gainers.length}`);
+  console.log(`  Top losers: ${losers.length}`);
 
-  // Debug: Show what we're writing
+  // Debug: Show top 3
   if (gainers.length > 0) {
-    console.log('\nTop 3 gainers to write:');
+    console.log('\n  Top 3 gainers:');
     for (let i = 0; i < Math.min(3, gainers.length); i++) {
       const g = gainers[i];
-      console.log(`  [${i}] ${g.market_id.slice(0, 8)}... +${g.change_pp.toFixed(2)}pp "${g.title.slice(0, 40)}"`);
+      console.log(`    [${i}] +${g.change_pp.toFixed(1)}pp "${g.title.slice(0, 50)}"`);
     }
   }
   if (losers.length > 0) {
-    console.log('\nTop 3 losers to write:');
+    console.log('\n  Top 3 losers:');
     for (let i = 0; i < Math.min(3, losers.length); i++) {
       const l = losers[i];
-      console.log(`  [${i}] ${l.market_id.slice(0, 8)}... ${l.change_pp.toFixed(2)}pp "${l.title.slice(0, 40)}"`);
+      console.log(`    [${i}] ${l.change_pp.toFixed(1)}pp "${l.title.slice(0, 50)}"`);
     }
   }
 
-  return { gainers, losers, stats, rpcError: false };
+  return { gainers, losers, stats, error: false };
 }
 
 async function updateCache(
   supabase: AnySupabaseClient,
   entry: CacheEntry
 ): Promise<boolean> {
-  console.log(`\nWriting cache for ${entry.window_key}...`);
-  console.log(`  top_gainers.length = ${entry.top_gainers.length}`);
-  console.log(`  top_losers.length = ${entry.top_losers.length}`);
+  console.log(`\n[Upsert] Writing cache for ${entry.window_key}...`);
+  console.log(`  top_gainers: ${entry.top_gainers.length}, top_losers: ${entry.top_losers.length}`);
 
   const { error } = await supabase
     .from('movers_cache')
     .upsert(entry, { onConflict: 'window_key' });
 
   if (error) {
-    console.error(`Cache write ERROR: ${error.message}`);
-    console.error(`Error details:`, JSON.stringify(error, null, 2));
+    console.error(`  Cache write ERROR: ${error.message}`);
     return false;
   }
 
-  console.log(`✅ Cache written successfully for ${entry.window_key}`);
+  console.log(`  Cache written successfully for ${entry.window_key}`);
   return true;
 }
 
@@ -335,7 +525,7 @@ async function updateCache(
 async function main() {
   const startTime = Date.now();
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         COMPUTE MOVERS CACHE - DEBUG MODE                  ║');
+  console.log('║     COMPUTE MOVERS CACHE (NO RPC - Direct Query)          ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`Time: ${new Date().toISOString()}`);
 
@@ -352,33 +542,41 @@ async function main() {
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
-  const results: Array<{ window: string; gainers: number; losers: number; status: 'updated' | 'skipped_rpc_error' | 'write_failed' | 'exception' }> = [];
+  const results: Array<{
+    window: string;
+    gainers: number;
+    losers: number;
+    status: 'updated' | 'skipped_error' | 'write_failed' | 'exception';
+  }> = [];
 
   for (const config of WINDOW_CONFIGS) {
     try {
       const windowStart = Date.now();
-      const { gainers, losers, stats, rpcError } = await computeMoversForWindow(supabase, config);
+      const { gainers, losers, stats, error } = await computeMoversForWindow(supabase, config);
 
-      // If RPC error occurred, skip cache update to preserve existing data
-      if (rpcError) {
-        console.log(`\n⏭️ SKIPPING cache update for ${config.window_key} due to RPC error`);
+      // If query error occurred, skip cache update to preserve existing data
+      if (error) {
+        console.log(`\n⏭️ SKIPPING cache update for ${config.window_key} due to query error`);
         results.push({
           window: config.window_key,
           gainers: 0,
           losers: 0,
-          status: 'skipped_rpc_error',
+          status: 'skipped_error',
         });
         continue;
       }
 
-      // RPC succeeded (even if empty) - update the cache
+      // Query succeeded (even if empty) - update the cache
       const cacheEntry: CacheEntry = {
         window_key: config.window_key,
         generated_at: new Date().toISOString(),
         params: {
           window_minutes: config.window_minutes,
-          limit_n: config.limit,
-          filters_applied: ['48h_scan', 'numeric_validation'],
+          limit: config.limit,
+          min_volume_usd: config.min_volume_usd,
+          min_price: MIN_PRICE,
+          max_price: MAX_PRICE,
+          min_change_pp: MIN_CHANGE_PP,
           stats: stats,
         },
         top_gainers: gainers,
@@ -396,8 +594,8 @@ async function main() {
         losers: losers.length,
         status: success ? 'updated' : 'write_failed',
       });
-    } catch (error) {
-      console.error(`\n❌ EXCEPTION computing ${config.window_key}:`, error);
+    } catch (err) {
+      console.error(`\n❌ EXCEPTION computing ${config.window_key}:`, err);
       results.push({
         window: config.window_key,
         gainers: 0,
@@ -416,14 +614,14 @@ async function main() {
 
   // Count by status
   const updated = results.filter(r => r.status === 'updated');
-  const skippedRpc = results.filter(r => r.status === 'skipped_rpc_error');
+  const skipped = results.filter(r => r.status === 'skipped_error');
   const writeFailed = results.filter(r => r.status === 'write_failed');
   const exceptions = results.filter(r => r.status === 'exception');
 
   console.log('\n📊 Summary:');
   console.log(`  ✅ Successfully updated: ${updated.length}/${results.length} windows`);
-  if (skippedRpc.length > 0) {
-    console.log(`  ⏭️ Skipped (RPC timeout/error): ${skippedRpc.length} windows (previous cache preserved)`);
+  if (skipped.length > 0) {
+    console.log(`  ⏭️ Skipped (query error): ${skipped.length} windows (previous cache preserved)`);
   }
   if (writeFailed.length > 0) {
     console.log(`  ❌ Write failed: ${writeFailed.length} windows`);
@@ -441,9 +639,9 @@ async function main() {
         icon = '✅';
         detail = `${r.gainers} gainers, ${r.losers} losers`;
         break;
-      case 'skipped_rpc_error':
+      case 'skipped_error':
         icon = '⏭️';
-        detail = 'SKIPPED - RPC error (previous cache preserved)';
+        detail = 'SKIPPED - query error (previous cache preserved)';
         break;
       case 'write_failed':
         icon = '❌';
@@ -462,8 +660,8 @@ async function main() {
     console.log('\n🎉 All windows updated successfully!');
   } else if (updated.length > 0) {
     console.log(`\n⚠️ Partial success: ${updated.length}/${results.length} windows updated`);
-  } else if (skippedRpc.length === results.length) {
-    console.log('\n⚠️ All windows skipped due to RPC errors - previous cache data preserved');
+  } else if (skipped.length === results.length) {
+    console.log('\n⚠️ All windows skipped due to errors - previous cache data preserved');
   } else {
     console.log('\n❌ No windows were updated successfully');
   }
