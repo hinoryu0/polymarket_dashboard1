@@ -3,12 +3,6 @@ import { createClient } from '@supabase/supabase-js';
 
 type WindowType = '1h' | '6h' | '24h';
 
-const WINDOW_MINUTES: Record<WindowType, number> = {
-  '1h': 60,
-  '6h': 360,
-  '24h': 1440,
-};
-
 type MoverData = {
   market_id: string;
   title: string;
@@ -24,62 +18,27 @@ type MoverData = {
   delta_minutes: number;
 };
 
-type RpcMoverRow = {
-  market_id: string;
-  latest_time: string;
-  past_time: string;
-  yes_now: number;
-  yes_past: number;
-  change_pp: number;
-  delta_minutes: number;
+type CacheRow = {
+  window: string;
+  generated_at: string;
+  params: Record<string, unknown>;
+  top_gainers: MoverData[];
+  top_losers: MoverData[];
 };
 
-// Price range filter: exclude markets that are "already decided" (near 0 or 1)
-const MIN_PRICE = 0.05; // 5%
-const MAX_PRICE = 0.95; // 95%
-
-// Big moves filter: only show significant price movements
-const MIN_CHANGE_PP = 10; // Minimum 10 percentage points change
-
-// Sports keywords to filter out - these markets add noise to movers
-const SPORTS_KEYWORDS = [
-  // Leagues and competitions
-  'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
-  'nba', 'nfl', 'mlb', 'nhl', 'ufc', 'mls', 'epl', 'ucl',
-  'world cup', 'euro 2024', 'copa america',
-  // Teams (common ones)
-  'chelsea', 'arsenal', 'liverpool', 'man city', 'manchester', 'tottenham',
-  'barcelona', 'real madrid', 'bayern', 'juventus', 'psg', 'inter milan',
-  'lakers', 'celtics', 'warriors', 'bulls', 'knicks', 'nets',
-  'chiefs', 'eagles', 'cowboys', 'patriots', '49ers',
-  'yankees', 'dodgers', 'red sox', 'cubs', 'mets',
-  // Generic sports terms
-  'vs.', 'vs ', ' vs ', 'match', 'game ', 'win ', 'score', 'goals',
-  'touchdown', 'playoff', 'finals', 'championship', 'mvp',
-  'betting', 'spread', 'over/under', 'moneyline',
-];
-
-/**
- * Check if a market looks like a sports market based on title/slug
- * @param title - Market title
- * @param slug - Market slug (optional)
- * @returns true if this appears to be a sports market
- */
-function isSportsMarket(title: string, slug: string | null): boolean {
-  const textToCheck = `${title} ${slug || ''}`.toLowerCase();
-  return SPORTS_KEYWORDS.some(keyword => textToCheck.includes(keyword.toLowerCase()));
-}
+// Cache staleness threshold (30 minutes)
+const CACHE_STALE_THRESHOLD_MS = 30 * 60 * 1000;
 
 /**
  * GET /api/movers
  * Returns top gainers/losers based on price changes over time window
- * Uses SQL RPC function for efficient processing across entire price_snapshots table
+ * Reads from pre-computed movers_cache table (updated every 15 minutes)
  *
- * Filters applied:
- * - Big moves: abs(change_pp) >= 10 (at least 10pp movement) - SQL + backup in JS
- * - Volume: Window-dependent minimum ($1k/1h, $5k/6h, $15k/24h) - applied in SQL
- * - Price range: 5-95% (excludes "already decided" markets) - SQL + backup in JS
- * - Sports: Excludes sports markets by keyword matching on title/slug - JS filter
+ * Filters applied during cache computation:
+ * - Big moves: abs(change_pp) >= 10 (at least 10pp movement)
+ * - Volume: Window-dependent minimum ($1k/1h, $5k/6h, $15k/24h)
+ * - Price range: 5-95% (excludes "already decided" markets)
+ * - Category: Excludes sports, entertainment, celebrity markets
  */
 export async function GET(request: Request) {
   try {
@@ -105,7 +64,6 @@ export async function GET(request: Request) {
     }
 
     const window = windowParam as WindowType;
-    const windowMinutes = WINDOW_MINUTES[window];
     const now = new Date();
 
     // Initialize Supabase client
@@ -118,114 +76,64 @@ export async function GET(request: Request) {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Call RPC function to compute movers in SQL
-    const { data: rpcData, error: rpcError } = await supabase.rpc(
-      'get_movers',
-      {
-        window_minutes: windowMinutes,
-        limit_n: limit * 10  // Get more data, we'll split and limit in JS
+    // Read from movers_cache
+    const { data: cacheData, error: cacheError } = await supabase
+      .from('movers_cache')
+      .select('*')
+      .eq('window', window)
+      .single();
+
+    if (cacheError) {
+      // Cache miss - return empty results with warning
+      if (cacheError.code === 'PGRST116') {
+        console.log(`Cache miss for window=${window}`);
+        return NextResponse.json({
+          window,
+          limit,
+          generatedAt: now.toISOString(),
+          topGainers: [],
+          topLosers: [],
+          warning: 'cache_miss',
+        });
       }
-    ) as { data: RpcMoverRow[] | null; error: any };
-
-    if (rpcError) {
-      throw new Error(`RPC error: ${rpcError.message}`);
+      throw new Error(`Cache read error: ${cacheError.message}`);
     }
 
-    if (!rpcData || rpcData.length === 0) {
-      console.log(`No movers data returned from RPC for window=${window}`);
-      return NextResponse.json({
-        window,
-        limit,
-        generatedAt: now.toISOString(),
-        topGainers: [],
-        topLosers: [],
-      });
-    }
+    const cache = cacheData as CacheRow;
 
-    // Fetch market metadata for all markets in results
-    const marketIds = rpcData.map(row => row.market_id);
-    const { data: markets, error: marketsError } = await supabase
-      .from('markets')
-      .select('id, title, url, volume_usd')
-      .in('id', marketIds);
+    // Check if cache is stale
+    const cacheAge = now.getTime() - new Date(cache.generated_at).getTime();
+    const isStale = cacheAge > CACHE_STALE_THRESHOLD_MS;
 
-    if (marketsError) {
-      throw new Error(`Failed to fetch market metadata: ${marketsError.message}`);
-    }
-
-    // Create market lookup map
-    const marketMap = new Map(markets?.map(m => [m.id, m]) || []);
-
-    // Transform RPC results into MoverData format
-    const movers: MoverData[] = rpcData
-      .map(row => {
-        const market = marketMap.get(row.market_id);
-        if (!market) return null;
-
-        const change_abs = row.yes_now - row.yes_past;
-        const change_pct = (change_abs / row.yes_past) * 100;
-
-        // Extract slug from URL if possible (for backward compatibility)
-        let slug: string | null = null;
-        if (market.url && market.url.includes('/event/')) {
-          const match = market.url.match(/\/event\/([^/?]+)/);
-          slug = match ? match[1] : null;
-        }
-
-        return {
-          market_id: row.market_id,
-          title: market.title,
-          slug,
-          volume_usd: market.volume_usd,
-          latest_price: row.yes_now,
-          past_price: row.yes_past,
-          change_abs,
-          change_pct,
-          change_pp: row.change_pp,
-          latest_time: row.latest_time,
-          past_time: row.past_time,
-          delta_minutes: row.delta_minutes,
-        };
-      })
-      .filter((m): m is MoverData => m !== null)
-      // Filter out "already decided" markets (price < 5% or > 95%)
-      // This is a backup filter in case SQL function doesn't have the filter applied
-      .filter((m) => m.latest_price >= MIN_PRICE && m.latest_price <= MAX_PRICE)
-      // Filter out sports markets to reduce noise
-      .filter((m) => !isSportsMarket(m.title, m.slug))
-      // Big moves only: at least 10 percentage points change
-      // This is a backup filter in case SQL function doesn't have the filter applied
-      .filter((m) => Math.abs(m.change_pp) >= MIN_CHANGE_PP);
-
-    // Split into gainers and losers, then limit
-    const topGainers = movers
-      .filter((m) => m.change_pp > 0)
-      .sort((a, b) => b.change_pp - a.change_pp)
-      .slice(0, limit);
-
-    const topLosers = movers
-      .filter((m) => m.change_pp < 0)
-      .sort((a, b) => a.change_pp - b.change_pp)
-      .slice(0, limit);
+    // Apply limit to results
+    const topGainers = (cache.top_gainers || []).slice(0, limit);
+    const topLosers = (cache.top_losers || []).slice(0, limit);
 
     console.log(
-      `Movers computed (SQL RPC) for window=${window}: ` +
-      `${movers.length} total (>=10pp, volume, price, sports filters), ${topGainers.length} gainers, ${topLosers.length} losers`
+      `Movers from cache for window=${window}: ` +
+      `${topGainers.length} gainers, ${topLosers.length} losers, ` +
+      `cache age: ${Math.round(cacheAge / 1000)}s${isStale ? ' (STALE)' : ''}`
     );
 
-    return NextResponse.json({
+    const response: Record<string, unknown> = {
       window,
       limit,
-      generatedAt: now.toISOString(),
+      generatedAt: cache.generated_at,
       topGainers,
       topLosers,
-    });
+    };
+
+    if (isStale) {
+      response.warning = 'cache_stale';
+    }
+
+    return NextResponse.json(response);
   } catch (error) {
     console.error('Error in /api/movers:', error);
 
     return NextResponse.json(
       {
-        error: error instanceof Error ? error.message : 'Failed to compute movers',
+        error: error instanceof Error ? error.message : 'Failed to fetch movers',
       },
       { status: 500 }
     );
