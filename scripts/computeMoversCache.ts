@@ -1,8 +1,8 @@
 /**
  * Compute Movers Cache Script
  *
- * Computes market movers for all time windows and stores results in movers_cache table.
- * This replaces the expensive get_movers() RPC with a pre-computed cache.
+ * Calls the optimized get_movers() RPC function and stores results in movers_cache table.
+ * The RPC function only scans last 48 hours of snapshots (matching retention policy).
  *
  * Run by GitHub Actions every 15 minutes after snapshot ingestion.
  *
@@ -27,28 +27,19 @@ type AnySupabaseClient = SupabaseClient<any, any, any>;
 // ============================================================================
 
 type WindowConfig = {
-  window: string;
-  windowMinutes: number;
-  lookbackHours: number;  // How far back to query snapshots
-  minVolume: number;
-  toleranceMinutes: number;  // Max allowed deviation from target time
+  window_key: string;
+  window_minutes: number;
+  limit: number;
 };
 
 const WINDOW_CONFIGS: WindowConfig[] = [
-  { window: '1h', windowMinutes: 60, lookbackHours: 3, minVolume: 1000, toleranceMinutes: 90 },
-  { window: '6h', windowMinutes: 360, lookbackHours: 12, minVolume: 5000, toleranceMinutes: 180 },
-  { window: '24h', windowMinutes: 1440, lookbackHours: 48, minVolume: 15000, toleranceMinutes: 480 },
+  { window_key: '1h', window_minutes: 60, limit: 20 },
+  { window_key: '6h', window_minutes: 360, limit: 20 },
+  { window_key: '24h', window_minutes: 1440, limit: 20 },
 ];
 
-// Filters
-const MIN_CHANGE_PP = 10;  // Minimum 10 percentage points change
-const MIN_PRICE = 0.05;    // 5%
-const MAX_PRICE = 0.95;    // 95%
-const RESULTS_LIMIT = 20;  // Top N gainers and losers to store
-
-// Excluded categories (keyword-based since markets table lacks category field)
+// Sports/entertainment keywords to filter out
 const EXCLUDED_KEYWORDS = [
-  // Sports
   'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
   'nba', 'nfl', 'mlb', 'nhl', 'ufc', 'mls', 'epl', 'ucl',
   'world cup', 'euro 2024', 'copa america',
@@ -58,23 +49,22 @@ const EXCLUDED_KEYWORDS = [
   'chiefs', 'eagles', 'cowboys', 'patriots', '49ers',
   'yankees', 'dodgers', 'red sox', 'cubs', 'mets',
   'vs.', 'vs ', ' vs ', 'match', 'game ', 'score', 'goals',
-  'touchdown', 'playoff', 'finals', 'championship', 'mvp',
-  // Entertainment/Celebrity
   'grammy', 'oscar', 'emmy', 'golden globe', 'billboard',
   'kardashian', 'swift', 'beyonce', 'drake', 'kanye',
-  'bachelor', 'bachelorette', 'survivor', 'idol',
 ];
 
 // ============================================================================
 // Types
 // ============================================================================
 
-type Snapshot = {
-  id: string;
+type RpcMoverRow = {
   market_id: string;
-  yes_price: number;
-  volume_usd: number;
-  created_at: string;
+  latest_time: string;
+  past_time: string;
+  yes_now: number;
+  yes_past: number;
+  change_pp: number;
+  delta_minutes: number;
 };
 
 type Market = {
@@ -100,15 +90,12 @@ type MoverData = {
 };
 
 type CacheEntry = {
-  window_key: string;  // DB column name (window is reserved in Postgres)
+  window_key: string;
   generated_at: string;
   params: {
-    min_volume: number;
-    min_change_pp: number;
-    min_price: number;
-    max_price: number;
-    lookback_hours: number;
-    tolerance_minutes: number;
+    window_minutes: number;
+    limit: number;
+    filters: string[];
   };
   top_gainers: MoverData[];
   top_losers: MoverData[];
@@ -138,176 +125,89 @@ function extractSlug(url: string): string | null {
 async function computeMoversForWindow(
   supabase: AnySupabaseClient,
   config: WindowConfig
-): Promise<{ gainers: MoverData[]; losers: MoverData[]; stats: { snapshotsFetched: number; marketsProcessed: number } }> {
-  const now = new Date();
-  const lookbackTime = new Date(now.getTime() - config.lookbackHours * 60 * 60 * 1000);
-  const targetTime = new Date(now.getTime() - config.windowMinutes * 60 * 1000);
-  const toleranceMs = config.toleranceMinutes * 60 * 1000;
+): Promise<{ gainers: MoverData[]; losers: MoverData[]; rpcCount: number }> {
+  console.log(`\n--- Computing ${config.window_key} movers ---`);
+  console.log(`Window: ${config.window_minutes} minutes, Limit: ${config.limit}`);
 
-  console.log(`\n--- Computing ${config.window} movers ---`);
-  console.log(`Lookback: ${config.lookbackHours}h (since ${lookbackTime.toISOString()})`);
-  console.log(`Target time: ${targetTime.toISOString()} (±${config.toleranceMinutes}min tolerance)`);
-  console.log(`Min volume: $${config.minVolume}`);
+  // Call optimized RPC function (only scans last 48h)
+  const { data: rpcData, error: rpcError } = await supabase.rpc('get_movers', {
+    window_minutes: config.window_minutes,
+    limit_n: config.limit * 3,  // Get extra to allow for filtering
+  });
 
-  // Fetch snapshots within lookback window (paginated)
-  const allSnapshots: Snapshot[] = [];
-  let offset = 0;
-  const batchSize = 5000;
-
-  while (true) {
-    const { data: batch, error } = await supabase
-      .from('price_snapshots')
-      .select('id, market_id, yes_price, volume_usd, created_at')
-      .gte('created_at', lookbackTime.toISOString())
-      .not('yes_price', 'is', null)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + batchSize - 1);
-
-    if (error) {
-      throw new Error(`Failed to fetch snapshots: ${error.message}`);
-    }
-
-    if (!batch || batch.length === 0) break;
-
-    allSnapshots.push(...(batch as Snapshot[]));
-    offset += batchSize;
-
-    if (batch.length < batchSize) break;
+  if (rpcError) {
+    console.error(`RPC error for ${config.window_key}: ${rpcError.message}`);
+    return { gainers: [], losers: [], rpcCount: 0 };
   }
 
-  console.log(`Snapshots fetched: ${allSnapshots.length}`);
+  const rpcRows = (rpcData ?? []) as RpcMoverRow[];
+  console.log(`RPC returned: ${rpcRows.length} rows`);
 
-  if (allSnapshots.length === 0) {
-    return { gainers: [], losers: [], stats: { snapshotsFetched: 0, marketsProcessed: 0 } };
+  if (rpcRows.length === 0) {
+    return { gainers: [], losers: [], rpcCount: 0 };
   }
 
-  // Group snapshots by market_id
-  const snapshotsByMarket = new Map<string, Snapshot[]>();
-  for (const snap of allSnapshots) {
-    if (!snapshotsByMarket.has(snap.market_id)) {
-      snapshotsByMarket.set(snap.market_id, []);
-    }
-    snapshotsByMarket.get(snap.market_id)!.push(snap);
+  // Fetch market metadata for all markets
+  const marketIds = rpcRows.map(row => row.market_id);
+  const { data: markets, error: marketsError } = await supabase
+    .from('markets')
+    .select('id, title, url, volume_usd')
+    .in('id', marketIds);
+
+  if (marketsError) {
+    console.error(`Failed to fetch markets: ${marketsError.message}`);
+    return { gainers: [], losers: [], rpcCount: rpcRows.length };
   }
 
-  console.log(`Unique markets: ${snapshotsByMarket.size}`);
-
-  // Fetch market metadata
-  const marketIds = Array.from(snapshotsByMarket.keys());
+  const safeMarkets = (markets ?? []) as Market[];
   const marketMap = new Map<string, Market>();
-
-  // Fetch in batches of 500
-  for (let i = 0; i < marketIds.length; i += 500) {
-    const batchIds = marketIds.slice(i, i + 500);
-    const { data: markets, error: marketsError } = await supabase
-      .from('markets')
-      .select('id, title, url, volume_usd')
-      .in('id', batchIds);
-
-    if (marketsError) {
-      console.warn(`Warning: Failed to fetch market batch: ${marketsError.message}`);
-      continue;
-    }
-
-    // Explicitly type the markets array to avoid TypeScript 'never' inference
-    const safeMarkets = (markets ?? []) as Market[];
-    for (const m of safeMarkets) {
-      marketMap.set(m.id, m);
-    }
+  for (const m of safeMarkets) {
+    marketMap.set(m.id, m);
   }
 
   console.log(`Markets with metadata: ${marketMap.size}`);
 
-  // Compute movers
+  // Transform RPC results into MoverData, filtering out excluded categories
   const movers: MoverData[] = [];
-
-  for (const [marketId, snapshots] of Array.from(snapshotsByMarket.entries())) {
-    const market = marketMap.get(marketId);
+  for (const row of rpcRows) {
+    const market = marketMap.get(row.market_id);
     if (!market) continue;
 
-    // Skip excluded categories
+    // Skip excluded categories (sports, entertainment)
     if (isExcludedMarket(market.title, market.url)) continue;
 
-    // Sort snapshots by time (newest first)
-    snapshots.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-
-    // Get latest snapshot
-    const latestSnap = snapshots[0];
-    if (!latestSnap || latestSnap.yes_price === null) continue;
-
-    // Check volume threshold
-    const volume = latestSnap.volume_usd ?? market.volume_usd ?? 0;
-    if (volume < config.minVolume) continue;
-
-    // Check price range
-    if (latestSnap.yes_price < MIN_PRICE || latestSnap.yes_price > MAX_PRICE) continue;
-
-    // Find snapshot closest to target time (within tolerance)
-    let pastSnap: Snapshot | null = null;
-    let minDiff = Infinity;
-
-    for (const snap of snapshots) {
-      if (snap.id === latestSnap.id) continue;
-      const snapTime = new Date(snap.created_at).getTime();
-      const diff = Math.abs(snapTime - targetTime.getTime());
-
-      if (diff <= toleranceMs && diff < minDiff) {
-        minDiff = diff;
-        pastSnap = snap;
-      }
-    }
-
-    if (!pastSnap || pastSnap.yes_price === null || pastSnap.yes_price <= 0) continue;
-
-    // Compute change
-    const changePp = (latestSnap.yes_price - pastSnap.yes_price) * 100;
-
-    // Check minimum change threshold
-    if (Math.abs(changePp) < MIN_CHANGE_PP) continue;
-
-    const latestTime = new Date(latestSnap.created_at);
-    const pastTime = new Date(pastSnap.created_at);
-    const deltaMinutes = Math.round((latestTime.getTime() - pastTime.getTime()) / 60000);
-
     movers.push({
-      market_id: marketId,
+      market_id: row.market_id,
       title: market.title,
       slug: extractSlug(market.url),
-      volume_usd: volume,
-      latest_price: latestSnap.yes_price,
-      past_price: pastSnap.yes_price,
-      change_abs: latestSnap.yes_price - pastSnap.yes_price,
-      change_pct: ((latestSnap.yes_price - pastSnap.yes_price) / pastSnap.yes_price) * 100,
-      change_pp: changePp,
-      latest_time: latestSnap.created_at,
-      past_time: pastSnap.created_at,
-      delta_minutes: deltaMinutes,
+      volume_usd: market.volume_usd,
+      latest_price: row.yes_now,
+      past_price: row.yes_past,
+      change_abs: row.yes_now - row.yes_past,
+      change_pct: row.yes_past > 0 ? ((row.yes_now - row.yes_past) / row.yes_past) * 100 : 0,
+      change_pp: row.change_pp,
+      latest_time: row.latest_time,
+      past_time: row.past_time,
+      delta_minutes: row.delta_minutes,
     });
   }
 
-  console.log(`Movers after filters: ${movers.length}`);
+  console.log(`Movers after category filter: ${movers.length}`);
 
   // Split into gainers and losers
   const gainers = movers
     .filter(m => m.change_pp > 0)
     .sort((a, b) => b.change_pp - a.change_pp)
-    .slice(0, RESULTS_LIMIT);
+    .slice(0, config.limit);
 
   const losers = movers
     .filter(m => m.change_pp < 0)
     .sort((a, b) => a.change_pp - b.change_pp)
-    .slice(0, RESULTS_LIMIT);
+    .slice(0, config.limit);
 
-  console.log(`Top gainers: ${gainers.length}, Top losers: ${losers.length}`);
+  console.log(`Gainers: ${gainers.length}, Losers: ${losers.length}`);
 
-  return {
-    gainers,
-    losers,
-    stats: {
-      snapshotsFetched: allSnapshots.length,
-      marketsProcessed: snapshotsByMarket.size,
-    },
-  };
+  return { gainers, losers, rpcCount: rpcRows.length };
 }
 
 async function updateCache(
@@ -343,23 +243,20 @@ async function main() {
 
   const supabase = createClient(supabaseUrl, supabaseKey);
 
-  const results: { window: string; gainers: number; losers: number; snapshotsFetched: number; marketsProcessed: number }[] = [];
+  const results: Array<{ window: string; gainers: number; losers: number; rpcCount: number }> = [];
 
   for (const config of WINDOW_CONFIGS) {
     try {
       const windowStart = Date.now();
-      const { gainers, losers, stats } = await computeMoversForWindow(supabase, config);
+      const { gainers, losers, rpcCount } = await computeMoversForWindow(supabase, config);
 
       const cacheEntry: CacheEntry = {
-        window_key: config.window,
+        window_key: config.window_key,
         generated_at: new Date().toISOString(),
         params: {
-          min_volume: config.minVolume,
-          min_change_pp: MIN_CHANGE_PP,
-          min_price: MIN_PRICE,
-          max_price: MAX_PRICE,
-          lookback_hours: config.lookbackHours,
-          tolerance_minutes: config.toleranceMinutes,
+          window_minutes: config.window_minutes,
+          limit: config.limit,
+          filters: ['48h_retention', '10pp_min', '5-95%_price', 'volume_threshold', 'no_sports'],
         },
         top_gainers: gainers,
         top_losers: losers,
@@ -368,17 +265,22 @@ async function main() {
       await updateCache(supabase, cacheEntry);
 
       const windowDuration = Date.now() - windowStart;
-      console.log(`Cache updated for ${config.window} in ${windowDuration}ms`);
+      console.log(`Cache updated for ${config.window_key} in ${windowDuration}ms`);
 
       results.push({
-        window: config.window,
+        window: config.window_key,
         gainers: gainers.length,
         losers: losers.length,
-        snapshotsFetched: stats.snapshotsFetched,
-        marketsProcessed: stats.marketsProcessed,
+        rpcCount,
       });
     } catch (error) {
-      console.error(`ERROR computing ${config.window}:`, error);
+      console.error(`ERROR computing ${config.window_key}:`, error);
+      results.push({
+        window: config.window_key,
+        gainers: 0,
+        losers: 0,
+        rpcCount: 0,
+      });
     }
   }
 
@@ -388,7 +290,7 @@ async function main() {
   console.log(`Total duration: ${totalDuration}ms (${(totalDuration / 1000).toFixed(2)}s)`);
   console.log('\nResults:');
   for (const r of results) {
-    console.log(`  ${r.window}: ${r.gainers} gainers, ${r.losers} losers (${r.snapshotsFetched} snapshots, ${r.marketsProcessed} markets)`);
+    console.log(`  ${r.window}: ${r.gainers} gainers, ${r.losers} losers (RPC returned ${r.rpcCount} rows)`);
   }
 
   process.exit(0);

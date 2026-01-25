@@ -1,7 +1,8 @@
--- RPC function to compute market movers efficiently in SQL
--- This avoids pagination limits and processes ALL snapshots directly in the database
--- Enforces tolerance to ensure movers reflect actual movement within the requested window
+-- Optimized RPC function to compute market movers efficiently in SQL
+-- CRITICAL: Only scans last 48 hours of price_snapshots to avoid timeouts
+--
 -- Filters:
+--   - Time range: Only snapshots from last 48 hours (matches retention policy)
 --   - Big moves only: abs(change_pp) >= 10 (at least 10 percentage points movement)
 --   - Price range: Excludes markets with latest price < 5% or > 95% (already decided)
 --   - Volume: Window-dependent minimum volume to exclude low-liquidity junk markets
@@ -11,7 +12,7 @@
 
 CREATE OR REPLACE FUNCTION get_movers(
   window_minutes INTEGER DEFAULT 1440,
-  limit_n INTEGER DEFAULT 10
+  limit_n INTEGER DEFAULT 20
 )
 RETURNS TABLE (
   market_id TEXT,
@@ -39,8 +40,6 @@ BEGIN
   END;
 
   -- Calculate minimum volume based on window size
-  -- Shorter windows = lower volume threshold (more responsive)
-  -- Longer windows = higher volume threshold (more stable/liquid markets)
   min_volume_usd := CASE
     WHEN window_minutes <= 60 THEN 1000      -- 1h window: >= $1,000
     WHEN window_minutes <= 360 THEN 5000     -- 6h window: >= $5,000
@@ -48,20 +47,31 @@ BEGIN
   END;
 
   RETURN QUERY
-  WITH latest_snapshots AS (
-    -- Get the most recent snapshot per market (with volume)
-    SELECT DISTINCT ON (ps.market_id)
+  -- CRITICAL: First filter to only last 48 hours to avoid full table scan
+  WITH recent_snapshots AS (
+    SELECT
+      ps.id,
       ps.market_id,
-      ps.created_at AS latest_time,
-      ps.yes_price AS yes_now,
-      ps.volume_usd AS latest_volume
-    FROM price_snapshots ps
-    WHERE ps.yes_price IS NOT NULL
-    ORDER BY ps.market_id, ps.created_at DESC
+      ps.yes_price,
+      ps.volume_usd,
+      ps.created_at
+    FROM public.price_snapshots ps
+    WHERE ps.created_at >= now() - interval '48 hours'
+      AND ps.yes_price IS NOT NULL
+  ),
+  latest_snapshots AS (
+    -- Get the most recent snapshot per market (with volume)
+    SELECT DISTINCT ON (rs.market_id)
+      rs.market_id,
+      rs.created_at AS latest_time,
+      rs.yes_price AS yes_now,
+      rs.volume_usd AS latest_volume
+    FROM recent_snapshots rs
+    ORDER BY rs.market_id, rs.created_at DESC
   ),
   target_times AS (
     -- Calculate target time (window ago) for each market
-    -- Also apply volume filter early to reduce work
+    -- Apply volume filter early to reduce work
     SELECT
       ls.market_id,
       ls.latest_time,
@@ -70,7 +80,7 @@ BEGIN
       (ls.latest_time - (window_minutes || ' minutes')::INTERVAL) AS target_time
     FROM latest_snapshots ls
     WHERE ls.latest_volume IS NOT NULL
-      AND ls.latest_volume >= min_volume_usd  -- Volume filter on latest snapshot
+      AND ls.latest_volume >= min_volume_usd
   ),
   past_snapshots AS (
     -- Find the snapshot closest to target_time for each market
@@ -81,16 +91,15 @@ BEGIN
       tt.yes_now,
       tt.latest_volume,
       tt.target_time,
-      ps.created_at AS past_time,
-      ps.yes_price AS yes_past,
-      ps.volume_usd AS past_volume,
-      ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) AS time_diff_seconds
+      rs.created_at AS past_time,
+      rs.yes_price AS yes_past,
+      rs.volume_usd AS past_volume,
+      ABS(EXTRACT(EPOCH FROM (rs.created_at - tt.target_time))) AS time_diff_seconds
     FROM target_times tt
-    JOIN price_snapshots ps ON ps.market_id = tt.market_id
-    WHERE ps.yes_price IS NOT NULL
-      AND ps.created_at < tt.latest_time  -- Must be before latest (not the same snapshot)
-      AND ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) <= max_abs_diff_seconds  -- Within tolerance
-    ORDER BY tt.market_id, ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) ASC
+    JOIN recent_snapshots rs ON rs.market_id = tt.market_id
+    WHERE rs.created_at < tt.latest_time
+      AND ABS(EXTRACT(EPOCH FROM (rs.created_at - tt.target_time))) <= max_abs_diff_seconds
+    ORDER BY tt.market_id, ABS(EXTRACT(EPOCH FROM (rs.created_at - tt.target_time))) ASC
   ),
   computed_movers AS (
     -- Compute change and apply filters
@@ -104,9 +113,9 @@ BEGIN
       ROUND(EXTRACT(EPOCH FROM (psnap.latest_time - psnap.past_time)) / 60)::INTEGER AS delta_minutes
     FROM past_snapshots psnap
     WHERE psnap.yes_past IS NOT NULL
-      AND psnap.yes_past > 0  -- Avoid divide by zero
-      AND psnap.yes_now BETWEEN 0.05 AND 0.95  -- Exclude "already decided" markets (5-95% filter)
-      AND ABS((psnap.yes_now - psnap.yes_past) * 100) >= 10  -- Big moves only: >= 10 percentage points
+      AND psnap.yes_past > 0
+      AND psnap.yes_now BETWEEN 0.05 AND 0.95
+      AND ABS((psnap.yes_now - psnap.yes_past) * 100) >= 10
   )
   SELECT
     cm.market_id,
@@ -117,7 +126,7 @@ BEGIN
     cm.change_pp,
     cm.delta_minutes
   FROM computed_movers cm
-  ORDER BY ABS(cm.change_pp) DESC  -- Order by absolute change to get biggest movers first
+  ORDER BY ABS(cm.change_pp) DESC
   LIMIT limit_n;
 END;
 $$;
@@ -125,19 +134,15 @@ $$;
 -- Grant execute permission to anon and authenticated users
 GRANT EXECUTE ON FUNCTION get_movers TO anon, authenticated;
 
--- Example usage:
--- Get movers for 1h window with limit 10:
--- SELECT * FROM get_movers(60, 10);
---
--- Get movers for 6h window:
--- SELECT * FROM get_movers(360, 10);
---
--- Get movers for 24h window:
--- SELECT * FROM get_movers(1440, 10);
+-- CRITICAL: Indexes for efficient 48h queries
+-- These indexes are essential for the function to perform well
+CREATE INDEX IF NOT EXISTS idx_price_snapshots_created_at
+  ON public.price_snapshots(created_at DESC);
 
--- Create index to speed up the query if not exists
 CREATE INDEX IF NOT EXISTS idx_price_snapshots_market_created
-  ON price_snapshots(market_id, created_at DESC);
+  ON public.price_snapshots(market_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_price_snapshots_created
-  ON price_snapshots(created_at DESC);
+-- Example usage:
+-- SELECT * FROM get_movers(60, 20);   -- 1h window
+-- SELECT * FROM get_movers(360, 20);  -- 6h window
+-- SELECT * FROM get_movers(1440, 20); -- 24h window

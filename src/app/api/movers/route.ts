@@ -19,7 +19,7 @@ type MoverData = {
 };
 
 type CacheRow = {
-  window_key: string;  // DB column name (window is reserved in Postgres)
+  window_key: string;
   generated_at: string;
   params: Record<string, unknown>;
   top_gainers: MoverData[];
@@ -32,9 +32,13 @@ const CACHE_STALE_THRESHOLD_MS = 30 * 60 * 1000;
 /**
  * GET /api/movers
  * Returns top gainers/losers based on price changes over time window
- * Reads from pre-computed movers_cache table (updated every 15 minutes)
+ * Reads ONLY from pre-computed movers_cache table (updated every 15 minutes)
+ *
+ * This endpoint does NOT call any RPC or compute movers on-demand.
+ * If cache is missing or empty, it returns an error.
  *
  * Filters applied during cache computation:
+ * - Time range: Only last 48 hours of snapshots
  * - Big moves: abs(change_pp) >= 10 (at least 10pp movement)
  * - Volume: Window-dependent minimum ($1k/1h, $5k/6h, $15k/24h)
  * - Price range: 5-95% (excludes "already decided" markets)
@@ -76,30 +80,48 @@ export async function GET(request: Request) {
 
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Read from movers_cache (window_key is the DB column, window is reserved in Postgres)
+    // Read from movers_cache ONLY (no RPC calls)
     const { data: cacheData, error: cacheError } = await supabase
       .from('movers_cache')
       .select('*')
       .eq('window_key', window)
       .single();
 
+    // Handle cache miss
     if (cacheError) {
-      // Cache miss - return empty results with warning
       if (cacheError.code === 'PGRST116') {
         console.log(`Cache miss for window=${window}`);
         return NextResponse.json({
           window,
           limit,
-          generatedAt: now.toISOString(),
+          generatedAt: null,
           topGainers: [],
           topLosers: [],
-          warning: 'cache_miss',
+          error: 'cache_missing',
+          message: `No cached data for ${window} window. Cache is updated every 15 minutes.`,
         });
       }
       throw new Error(`Cache read error: ${cacheError.message}`);
     }
 
     const cache = cacheData as CacheRow;
+
+    // Check if cache has data
+    const hasGainers = cache.top_gainers && cache.top_gainers.length > 0;
+    const hasLosers = cache.top_losers && cache.top_losers.length > 0;
+
+    if (!hasGainers && !hasLosers) {
+      console.log(`Cache empty for window=${window}`);
+      return NextResponse.json({
+        window,
+        limit,
+        generatedAt: cache.generated_at,
+        topGainers: [],
+        topLosers: [],
+        error: 'cache_empty',
+        message: `Cache exists but contains no movers for ${window} window. This may indicate insufficient price movements or data.`,
+      });
+    }
 
     // Check if cache is stale
     const cacheAge = now.getTime() - new Date(cache.generated_at).getTime();
