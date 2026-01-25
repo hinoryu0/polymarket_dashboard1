@@ -2,6 +2,7 @@
 -- This avoids pagination limits and processes ALL snapshots directly in the database
 -- Enforces tolerance to ensure movers reflect actual movement within the requested window
 -- Filters:
+--   - Big moves only: abs(change_pp) >= 10 (at least 10 percentage points movement)
 --   - Price range: Excludes markets with latest price < 5% or > 95% (already decided)
 --   - Volume: Window-dependent minimum volume to exclude low-liquidity junk markets
 --     * 1h window: >= $1,000
@@ -103,6 +104,7 @@ BEGIN
   WHERE ps.yes_past IS NOT NULL
     AND ps.yes_past > 0  -- Avoid divide by zero
     AND ps.yes_now BETWEEN 0.05 AND 0.95  -- Exclude "already decided" markets (5-95% filter)
+    AND ABS((ps.yes_now - ps.yes_past) * 100) >= 10  -- Big moves only: >= 10 percentage points
   ORDER BY change_pp DESC;  -- Return all, client will split into gainers/losers
 END;
 $$;
