@@ -96,7 +96,7 @@ type MoverData = {
 };
 
 type CacheEntry = {
-  window: string;
+  window_key: string;  // DB column name (window is reserved in Postgres)
   generated_at: string;
   params: {
     min_volume: number;
@@ -310,10 +310,10 @@ async function updateCache(
 ): Promise<void> {
   const { error } = await supabase
     .from('movers_cache')
-    .upsert(entry, { onConflict: 'window' });
+    .upsert(entry, { onConflict: 'window_key' });
 
   if (error) {
-    throw new Error(`Failed to update cache for ${entry.window}: ${error.message}`);
+    throw new Error(`Failed to update cache for ${entry.window_key}: ${error.message}`);
   }
 }
 
@@ -345,7 +345,7 @@ async function main() {
       const { gainers, losers, stats } = await computeMoversForWindow(supabase, config);
 
       const cacheEntry: CacheEntry = {
-        window: config.window,
+        window_key: config.window,
         generated_at: new Date().toISOString(),
         params: {
           min_volume: config.minVolume,
