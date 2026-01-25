@@ -38,10 +38,15 @@ const WINDOW_CONFIGS: WindowConfig[] = [
   { window_key: '24h', window_minutes: 1440, limit: 20 },
 ];
 
-// Sports/entertainment keywords to filter out (optional, applied gently)
+// Sports/entertainment keywords to filter out
+// NOTE: Only specific league/team names - NO generic words like "vs", "match", "game", "score"
 const EXCLUDED_KEYWORDS = [
-  'premier league', 'champions league', 'nba', 'nfl', 'mlb', 'nhl', 'ufc',
-  'chelsea', 'arsenal', 'liverpool', 'lakers', 'yankees',
+  // Leagues only
+  'premier league', 'champions league', 'la liga', 'serie a', 'bundesliga',
+  'nba', 'nfl', 'mlb', 'nhl', 'ufc', 'mls',
+  // Teams only (specific names)
+  'chelsea', 'arsenal', 'liverpool', 'man city', 'tottenham',
+  'lakers', 'celtics', 'warriors', 'yankees', 'dodgers',
 ];
 
 // ============================================================================
@@ -185,6 +190,13 @@ async function computeMoversForWindow(
   stats.markets_found = marketMap.size;
   console.log(`Markets with metadata: ${marketMap.size}`);
 
+  // Debug: Show first 5 market titles BEFORE any filtering
+  console.log('\nFirst 5 market titles (before filtering):');
+  const sampleMarkets = safeMarkets.slice(0, 5);
+  for (let i = 0; i < sampleMarkets.length; i++) {
+    console.log(`  [${i}] "${sampleMarkets[i].title}"`);
+  }
+
   // Transform to MoverCacheItem, applying minimal filtering
   const allMovers: MoverCacheItem[] = [];
   let excludedCount = 0;
@@ -219,7 +231,9 @@ async function computeMoversForWindow(
 
   stats.excluded_sports = excludedCount;
   stats.movers_total = allMovers.length;
-  console.log(`\nMovers after processing: ${allMovers.length} (excluded ${excludedCount} sports)`);
+  console.log(`\nMovers after processing: ${allMovers.length}`);
+  console.log(`  - Excluded by sports filter: ${excludedCount}`);
+  console.log(`  - Kept: ${allMovers.length}`);
 
   if (allMovers.length === 0) {
     console.log('No movers after processing');
