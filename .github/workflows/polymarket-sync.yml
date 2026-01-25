@@ -52,6 +52,12 @@ jobs:
           # DEBUG_MARKET_ID: "1249293"  # Uncomment to enable debug mode for a specific market
         run: npm run fetch-markets
 
+      - name: Compute movers cache
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: npm run compute-movers-cache
+
       - name: Log sync end
         if: always()
         run: |

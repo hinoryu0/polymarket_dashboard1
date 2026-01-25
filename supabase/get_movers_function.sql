@@ -63,14 +63,14 @@ BEGIN
     -- Calculate target time (window ago) for each market
     -- Also apply volume filter early to reduce work
     SELECT
-      market_id,
-      latest_time,
-      yes_now,
-      latest_volume,
-      (latest_time - (window_minutes || ' minutes')::INTERVAL) AS target_time
-    FROM latest_snapshots
-    WHERE latest_volume IS NOT NULL
-      AND latest_volume >= min_volume_usd  -- Volume filter on latest snapshot
+      ls.market_id,
+      ls.latest_time,
+      ls.yes_now,
+      ls.latest_volume,
+      (ls.latest_time - (window_minutes || ' minutes')::INTERVAL) AS target_time
+    FROM latest_snapshots ls
+    WHERE ls.latest_volume IS NOT NULL
+      AND ls.latest_volume >= min_volume_usd  -- Volume filter on latest snapshot
   ),
   past_snapshots AS (
     -- Find the snapshot closest to target_time for each market
@@ -91,21 +91,34 @@ BEGIN
       AND ps.created_at < tt.latest_time  -- Must be before latest (not the same snapshot)
       AND ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) <= max_abs_diff_seconds  -- Within tolerance
     ORDER BY tt.market_id, ABS(EXTRACT(EPOCH FROM (ps.created_at - tt.target_time))) ASC
+  ),
+  computed_movers AS (
+    -- Compute change and apply filters
+    SELECT
+      psnap.market_id,
+      psnap.latest_time,
+      psnap.past_time,
+      psnap.yes_now::DOUBLE PRECISION AS yes_now,
+      psnap.yes_past::DOUBLE PRECISION AS yes_past,
+      ((psnap.yes_now - psnap.yes_past) * 100)::DOUBLE PRECISION AS change_pp,
+      ROUND(EXTRACT(EPOCH FROM (psnap.latest_time - psnap.past_time)) / 60)::INTEGER AS delta_minutes
+    FROM past_snapshots psnap
+    WHERE psnap.yes_past IS NOT NULL
+      AND psnap.yes_past > 0  -- Avoid divide by zero
+      AND psnap.yes_now BETWEEN 0.05 AND 0.95  -- Exclude "already decided" markets (5-95% filter)
+      AND ABS((psnap.yes_now - psnap.yes_past) * 100) >= 10  -- Big moves only: >= 10 percentage points
   )
   SELECT
-    ps.market_id,
-    ps.latest_time,
-    ps.past_time,
-    ps.yes_now,
-    ps.yes_past,
-    ((ps.yes_now - ps.yes_past) * 100)::DOUBLE PRECISION AS change_pp,
-    ROUND(EXTRACT(EPOCH FROM (ps.latest_time - ps.past_time)) / 60)::INTEGER AS delta_minutes
-  FROM past_snapshots ps
-  WHERE ps.yes_past IS NOT NULL
-    AND ps.yes_past > 0  -- Avoid divide by zero
-    AND ps.yes_now BETWEEN 0.05 AND 0.95  -- Exclude "already decided" markets (5-95% filter)
-    AND ABS((ps.yes_now - ps.yes_past) * 100) >= 10  -- Big moves only: >= 10 percentage points
-  ORDER BY change_pp DESC;  -- Return all, client will split into gainers/losers
+    cm.market_id,
+    cm.latest_time,
+    cm.past_time,
+    cm.yes_now,
+    cm.yes_past,
+    cm.change_pp,
+    cm.delta_minutes
+  FROM computed_movers cm
+  ORDER BY ABS(cm.change_pp) DESC  -- Order by absolute change to get biggest movers first
+  LIMIT limit_n;
 END;
 $$;
 
