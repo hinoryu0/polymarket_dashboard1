@@ -1,10 +1,21 @@
 /**
  * Core ingestion logic for Polymarket market data
  * Can be called from both API routes (Vercel) and CLI scripts (GitHub Actions)
+ *
+ * Includes allowlist-based filtering:
+ * - Markets are categorized based on keywords
+ * - Only markets in allowed categories get snapshots
+ * - Significantly reduces Supabase writes
  */
 
 import { createClient } from '@supabase/supabase-js';
 import type { GammaMarket, MarketRecord, IngestionResult } from './types';
+import {
+  categorizeMarket,
+  isCategoryAllowed,
+  getAllowedCategories,
+  type CategorizationResult,
+} from './categorization';
 
 // Configuration
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets';
@@ -319,13 +330,27 @@ export function normalizeMarket(gammaMarket: GammaMarket, debugMarketId?: string
     urlSource = 'Priority C (search fallback)';
   }
 
+  // Categorize the market
+  const categorizationResult = categorizeMarket(title, url);
+
+  if (isDebugMarket) {
+    console.log('\n🏷️ CATEGORIZATION:');
+    console.log('  category:', categorizationResult.category);
+    console.log('  tags:', categorizationResult.tags);
+    console.log('  confidence:', categorizationResult.confidence);
+    console.log('========================================\n');
+  }
+
   return {
     id: gammaMarket.id,
     title,
     url,
     yes_price: yesPrice,
     volume_usd: volumeUsd,
+    category: categorizationResult.category,
+    tags: categorizationResult.tags,
     _urlSource: urlSource, // Temporary field for logging
+    _categorizationConfidence: categorizationResult.confidence, // Temporary field for logging
   };
 }
 
@@ -426,14 +451,24 @@ export async function insertPriceSnapshots(markets: MarketRecord[]): Promise<num
   return snapshotsToInsert.length;
 }
 
+// Price range filter for snapshots
+const MIN_SNAPSHOT_PRICE = 0.05;
+const MAX_SNAPSHOT_PRICE = 0.95;
+
 /**
- * Create snapshots for ALL markets in the database
- * This runs after market upsert to ensure we have snapshots for all markets, not just newly fetched ones
+ * Create snapshots for markets in ALLOWED CATEGORIES only
+ * This is the key optimization to reduce Supabase writes.
+ *
+ * Filters applied:
+ * - Category must be in allowed list
+ * - yes_price must be between 0.05 and 0.95 (not already decided)
  */
 export async function createSnapshotsForAllMarkets(): Promise<{
   totalProcessed: number;
   snapshotsCreated: number;
   skippedNoPrice: number;
+  skippedByCategory: number;
+  skippedByPriceRange: number;
   errors: number;
 }> {
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -446,22 +481,27 @@ export async function createSnapshotsForAllMarkets(): Promise<{
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   const debugMarketId = process.env.DEBUG_MARKET_ID;
+  const allowedCategories = getAllowedCategories();
 
-  console.log('\n=== Creating Snapshots for All Markets ===');
+  console.log('\n=== Creating Snapshots (Category-Filtered) ===');
+  console.log(`Allowed categories: ${allowedCategories.join(', ')}`);
+  console.log(`Price range filter: ${MIN_SNAPSHOT_PRICE} - ${MAX_SNAPSHOT_PRICE}`);
 
   const BATCH_SIZE = 500; // Process 500 markets per batch
   let offset = 0;
   let totalProcessed = 0;
   let snapshotsCreated = 0;
   let skippedNoPrice = 0;
+  let skippedByCategory = 0;
+  let skippedByPriceRange = 0;
   let errors = 0;
   let hasMore = true;
 
   while (hasMore) {
-    // Fetch a batch of markets from Supabase
+    // Fetch a batch of markets from Supabase (including category)
     const { data: markets, error: fetchError } = await supabase
       .from('markets')
-      .select('id, yes_price, volume_usd')
+      .select('id, yes_price, volume_usd, category')
       .range(offset, offset + BATCH_SIZE - 1)
       .order('id', { ascending: true }); // Consistent ordering for pagination
 
@@ -478,12 +518,26 @@ export async function createSnapshotsForAllMarkets(): Promise<{
 
     console.log(`Processing batch: offset=${offset}, count=${markets.length}`);
 
-    // Filter markets with valid yes_price
+    // Filter markets with valid criteria
     const validMarkets = markets.filter(m => {
+      // Check: valid yes_price
       if (m.yes_price === null || m.yes_price === undefined || typeof m.yes_price !== 'number' || isNaN(m.yes_price)) {
         skippedNoPrice++;
         return false;
       }
+
+      // Check: price range (not already decided)
+      if (m.yes_price < MIN_SNAPSHOT_PRICE || m.yes_price > MAX_SNAPSHOT_PRICE) {
+        skippedByPriceRange++;
+        return false;
+      }
+
+      // Check: category is in allowed list
+      if (!m.category || !allowedCategories.includes(m.category)) {
+        skippedByCategory++;
+        return false;
+      }
+
       return true;
     });
 
@@ -498,14 +552,16 @@ export async function createSnapshotsForAllMarkets(): Promise<{
 
       // Debug output for specific market in this batch
       if (debugMarketId) {
+        const debugMarket = markets.find(m => m.id === debugMarketId);
         const debugSnapshot = snapshots.find(s => s.market_id === debugMarketId);
-        if (debugSnapshot) {
+        if (debugMarket) {
           console.log('\n========================================');
-          console.log('🔍 DEBUG - Snapshot from ALL MARKETS batch for', debugMarketId);
+          console.log('🔍 DEBUG - Market in batch:', debugMarketId);
           console.log('========================================');
-          console.log('market_id:', debugSnapshot.market_id);
-          console.log('yes_price:', debugSnapshot.yes_price);
-          console.log('volume_usd:', debugSnapshot.volume_usd);
+          console.log('category:', debugMarket.category);
+          console.log('yes_price:', debugMarket.yes_price);
+          console.log('in allowed categories:', debugMarket.category && allowedCategories.includes(debugMarket.category));
+          console.log('snapshot included:', !!debugSnapshot);
           console.log('========================================\n');
         }
       }
@@ -521,10 +577,11 @@ export async function createSnapshotsForAllMarkets(): Promise<{
         // Continue with next batch even if this one fails
       } else {
         snapshotsCreated += snapshots.length;
-        console.log(`  ✓ Inserted ${snapshots.length} snapshots (skipped ${markets.length - validMarkets.length} with null price)`);
+        const batchSkipped = markets.length - validMarkets.length;
+        console.log(`  ✓ Inserted ${snapshots.length} snapshots (skipped ${batchSkipped})`);
       }
     } else {
-      console.log(`  ⊘ Skipped entire batch - no markets with valid yes_price`);
+      console.log(`  ⊘ Skipped entire batch - no markets passed filters`);
     }
 
     totalProcessed += markets.length;
@@ -540,12 +597,16 @@ export async function createSnapshotsForAllMarkets(): Promise<{
   console.log(`Total markets processed: ${totalProcessed}`);
   console.log(`Snapshots created: ${snapshotsCreated}`);
   console.log(`Skipped (no price): ${skippedNoPrice}`);
+  console.log(`Skipped (excluded category): ${skippedByCategory}`);
+  console.log(`Skipped (price out of range): ${skippedByPriceRange}`);
   console.log(`Errors: ${errors}`);
 
   return {
     totalProcessed,
     snapshotsCreated,
     skippedNoPrice,
+    skippedByCategory,
+    skippedByPriceRange,
     errors,
   };
 }
@@ -589,10 +650,16 @@ export async function runIngestion(): Promise<IngestionResult> {
     return {
       marketsUpserted: 0,
       snapshotsInserted: 0,
+      snapshotsSkippedByCategory: 0,
+      snapshotsSkippedByPrice: 0,
       fetchedMarketsTotal: 0,
       keptMarketsTotal: 0,
       filteredInactiveCount: 0,
       filteredSportsCount: 0,
+      categorizedMarkets: 0,
+      allowedCategoryMarkets: 0,
+      excludedCategoryMarkets: 0,
+      categoryBreakdown: {},
       lastSnapshotCreatedAt: null,
     };
   }
@@ -614,10 +681,16 @@ export async function runIngestion(): Promise<IngestionResult> {
     return {
       marketsUpserted: 0,
       snapshotsInserted: 0,
+      snapshotsSkippedByCategory: 0,
+      snapshotsSkippedByPrice: 0,
       fetchedMarketsTotal,
       keptMarketsTotal: 0,
       filteredInactiveCount,
       filteredSportsCount,
+      categorizedMarkets: 0,
+      allowedCategoryMarkets: 0,
+      excludedCategoryMarkets: 0,
+      categoryBreakdown: {},
       lastSnapshotCreatedAt: null,
     };
   }
@@ -647,8 +720,59 @@ export async function runIngestion(): Promise<IngestionResult> {
     console.log(`  ${idx + 1}. "${titleShort}..." → ${market.url} (source: ${market._urlSource || 'unknown'})`);
   });
 
-  // Remove temporary _urlSource field before upserting to Supabase
-  const marketsForDb = normalizedMarkets.map(({ _urlSource, ...market }) => market);
+  // === Categorization Stats ===
+  console.log('\n=== Market Categorization Stats ===');
+  const allowedCategories = getAllowedCategories();
+  console.log(`Allowed categories: ${allowedCategories.join(', ')}`);
+
+  const categoryBreakdown: Record<string, number> = {};
+  let categorizedCount = 0;
+  let allowedCount = 0;
+  let excludedCount = 0;
+
+  for (const market of normalizedMarkets) {
+    const cat = market.category || 'null';
+    categoryBreakdown[cat] = (categoryBreakdown[cat] || 0) + 1;
+
+    if (market.category) {
+      categorizedCount++;
+      if (isCategoryAllowed(market.category as any)) {
+        allowedCount++;
+      } else {
+        excludedCount++;
+      }
+    } else {
+      excludedCount++;
+    }
+  }
+
+  console.log(`Total markets: ${normalizedMarkets.length}`);
+  console.log(`Categorized (non-null): ${categorizedCount}`);
+  console.log(`In allowed categories: ${allowedCount}`);
+  console.log(`Excluded (null or not allowed): ${excludedCount}`);
+  console.log('\nBreakdown by category:');
+  for (const [cat, count] of Object.entries(categoryBreakdown).sort((a, b) => b[1] - a[1])) {
+    const isAllowed = cat !== 'null' && allowedCategories.includes(cat);
+    const marker = isAllowed ? '✓' : '✗';
+    console.log(`  ${marker} ${cat}: ${count}`);
+  }
+
+  // Show sample markets by category
+  console.log('\nSample categorized markets:');
+  const sampleCategories = ['politics', 'crypto', 'technology', 'null'];
+  for (const cat of sampleCategories) {
+    const sample = normalizedMarkets.find(m => (m.category || 'null') === cat);
+    if (sample) {
+      const titleShort = sample.title.substring(0, 60);
+      console.log(`  [${cat}] "${titleShort}..."`);
+      if (sample.tags && sample.tags.length > 0) {
+        console.log(`         tags: ${sample.tags.slice(0, 5).join(', ')}`);
+      }
+    }
+  }
+
+  // Remove temporary fields before upserting to Supabase
+  const marketsForDb = normalizedMarkets.map(({ _urlSource, _categorizationConfidence, ...market }) => market);
 
   // Deduplicate markets by id to avoid Supabase upsert conflict error
   // "ON CONFLICT DO UPDATE command cannot affect row a second time"
@@ -677,15 +801,22 @@ export async function runIngestion(): Promise<IngestionResult> {
   const lastSnapshotCreatedAt = snapshotStats.snapshotsCreated > 0 ? new Date().toISOString() : null;
 
   console.log('=== Data Ingestion Completed Successfully ===');
-  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${deduplicatedMarkets.length}, Snapshots ${snapshotStats.snapshotsCreated}`);
+  console.log(`Summary: Fetched ${fetchedMarketsTotal}, Kept ${keptMarketsTotal}, Upserted ${deduplicatedMarkets.length}`);
+  console.log(`Snapshots: ${snapshotStats.snapshotsCreated} inserted, ${snapshotStats.skippedByCategory} excluded by category, ${snapshotStats.skippedByPriceRange} excluded by price`);
 
   const result: IngestionResult = {
     marketsUpserted: deduplicatedMarkets.length,
     snapshotsInserted: snapshotStats.snapshotsCreated,
+    snapshotsSkippedByCategory: snapshotStats.skippedByCategory,
+    snapshotsSkippedByPrice: snapshotStats.skippedByPriceRange,
     fetchedMarketsTotal,
     keptMarketsTotal,
     filteredInactiveCount,
     filteredSportsCount,
+    categorizedMarkets: categorizedCount,
+    allowedCategoryMarkets: allowedCount,
+    excludedCategoryMarkets: excludedCount,
+    categoryBreakdown,
     lastSnapshotCreatedAt,
   };
 
