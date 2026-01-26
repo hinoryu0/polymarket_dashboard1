@@ -14,8 +14,10 @@ import {
   categorizeMarket,
   isCategoryAllowed,
   getAllowedCategories,
+  getCategorizationStats,
   type CategorizationResult,
-} from './categorization';
+  type MarketCategory,
+} from '../categories';
 
 // Configuration
 const GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets';
@@ -481,10 +483,10 @@ export async function createSnapshotsForAllMarkets(): Promise<{
   const supabase = createClient(supabaseUrl, supabaseKey);
 
   const debugMarketId = process.env.DEBUG_MARKET_ID;
-  const allowedCategories = getAllowedCategories();
+  const allowedCategoriesSet = getAllowedCategories();
 
   console.log('\n=== Creating Snapshots (Category-Filtered) ===');
-  console.log(`Allowed categories: ${allowedCategories.join(', ')}`);
+  console.log(`Allowed categories: ${Array.from(allowedCategoriesSet).join(', ')}`);
   console.log(`Price range filter: ${MIN_SNAPSHOT_PRICE} - ${MAX_SNAPSHOT_PRICE}`);
 
   const BATCH_SIZE = 500; // Process 500 markets per batch
@@ -533,7 +535,7 @@ export async function createSnapshotsForAllMarkets(): Promise<{
       }
 
       // Check: category is in allowed list
-      if (!m.category || !allowedCategories.includes(m.category)) {
+      if (!m.category || !allowedCategoriesSet.has(m.category)) {
         skippedByCategory++;
         return false;
       }
@@ -560,7 +562,7 @@ export async function createSnapshotsForAllMarkets(): Promise<{
           console.log('========================================');
           console.log('category:', debugMarket.category);
           console.log('yes_price:', debugMarket.yes_price);
-          console.log('in allowed categories:', debugMarket.category && allowedCategories.includes(debugMarket.category));
+          console.log('in allowed categories:', debugMarket.category && allowedCategoriesSet.has(debugMarket.category));
           console.log('snapshot included:', !!debugSnapshot);
           console.log('========================================\n');
         }
@@ -722,13 +724,17 @@ export async function runIngestion(): Promise<IngestionResult> {
 
   // === Categorization Stats ===
   console.log('\n=== Market Categorization Stats ===');
-  const allowedCategories = getAllowedCategories();
-  console.log(`Allowed categories: ${allowedCategories.join(', ')}`);
+  const allowedCategoriesSet = getAllowedCategories();
+  const allowedCategoriesArray = Array.from(allowedCategoriesSet);
+  console.log(`Allowed categories: ${allowedCategoriesArray.join(', ')}`);
 
   const categoryBreakdown: Record<string, number> = {};
   let categorizedCount = 0;
   let allowedCount = 0;
   let excludedCount = 0;
+  let excludedBySports = 0;
+  let excludedByUnknown = 0;
+  let excludedByNotAllowlisted = 0;
 
   for (const market of normalizedMarkets) {
     const cat = market.category || 'null';
@@ -736,23 +742,32 @@ export async function runIngestion(): Promise<IngestionResult> {
 
     if (market.category) {
       categorizedCount++;
-      if (isCategoryAllowed(market.category as any)) {
+      if (isCategoryAllowed(market.category as MarketCategory)) {
         allowedCount++;
       } else {
         excludedCount++;
+        if (market.category === 'sports') {
+          excludedBySports++;
+        } else {
+          excludedByNotAllowlisted++;
+        }
       }
     } else {
       excludedCount++;
+      excludedByUnknown++;
     }
   }
 
   console.log(`Total markets: ${normalizedMarkets.length}`);
   console.log(`Categorized (non-null): ${categorizedCount}`);
   console.log(`In allowed categories: ${allowedCount}`);
-  console.log(`Excluded (null or not allowed): ${excludedCount}`);
+  console.log(`Excluded total: ${excludedCount}`);
+  console.log(`  - Sports: ${excludedBySports}`);
+  console.log(`  - Unknown (confidence < 2): ${excludedByUnknown}`);
+  console.log(`  - Not allowlisted: ${excludedByNotAllowlisted}`);
   console.log('\nBreakdown by category:');
   for (const [cat, count] of Object.entries(categoryBreakdown).sort((a, b) => b[1] - a[1])) {
-    const isAllowed = cat !== 'null' && allowedCategories.includes(cat);
+    const isAllowed = cat !== 'null' && allowedCategoriesSet.has(cat);
     const marker = isAllowed ? '✓' : '✗';
     console.log(`  ${marker} ${cat}: ${count}`);
   }

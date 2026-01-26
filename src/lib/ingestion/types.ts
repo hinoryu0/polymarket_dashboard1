@@ -23,7 +23,7 @@ export type MarketRecord = {
   tags?: string[] | null;    // Array of keyword tags for the market
   updated_at?: string;
   _urlSource?: string;       // Temporary field for logging
-  _categorizationConfidence?: string; // Temporary field for logging
+  _categorizationConfidence?: number; // Temporary field for logging (confidence score)
 };
 
 export type IngestionResult = {
