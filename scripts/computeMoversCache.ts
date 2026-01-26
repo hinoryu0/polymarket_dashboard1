@@ -546,7 +546,7 @@ async function main() {
     window: string;
     gainers: number;
     losers: number;
-    status: 'updated' | 'skipped_error' | 'write_failed' | 'exception';
+    status: 'updated' | 'skipped_error' | 'skipped_empty' | 'write_failed' | 'exception';
   }> = [];
 
   for (const config of WINDOW_CONFIGS) {
@@ -556,7 +556,7 @@ async function main() {
 
       // If query error occurred, skip cache update to preserve existing data
       if (error) {
-        console.log(`\n⏭️ SKIPPING cache update for ${config.window_key} due to query error`);
+        console.log(`\n⏭️ Skipping cache update for ${config.window_key} due to computation failure`);
         results.push({
           window: config.window_key,
           gainers: 0,
@@ -566,7 +566,22 @@ async function main() {
         continue;
       }
 
-      // Query succeeded (even if empty) - update the cache
+      // GUARD: Only update cache if we have actual movers data
+      // If computation succeeded but result is empty, preserve existing cache
+      if (gainers.length === 0 && losers.length === 0) {
+        console.log(`\n⏭️ Skipping cache update for ${config.window_key} - no movers found (preserving existing cache)`);
+        results.push({
+          window: config.window_key,
+          gainers: 0,
+          losers: 0,
+          status: 'skipped_empty',
+        });
+        continue;
+      }
+
+      // We have movers - update the cache
+      console.log(`\n✅ Updating cache for ${config.window_key}: ${gainers.length} gainers, ${losers.length} losers`);
+
       const cacheEntry: CacheEntry = {
         window_key: config.window_key,
         generated_at: new Date().toISOString(),
@@ -586,7 +601,7 @@ async function main() {
       const success = await updateCache(supabase, cacheEntry);
 
       const windowDuration = Date.now() - windowStart;
-      console.log(`\n${config.window_key} completed in ${windowDuration}ms`);
+      console.log(`${config.window_key} completed in ${windowDuration}ms`);
 
       results.push({
         window: config.window_key,
@@ -596,6 +611,7 @@ async function main() {
       });
     } catch (err) {
       console.error(`\n❌ EXCEPTION computing ${config.window_key}:`, err);
+      console.log(`⏭️ Skipping cache update for ${config.window_key} due to exception (preserving existing cache)`);
       results.push({
         window: config.window_key,
         gainers: 0,
@@ -614,14 +630,18 @@ async function main() {
 
   // Count by status
   const updated = results.filter(r => r.status === 'updated');
-  const skipped = results.filter(r => r.status === 'skipped_error');
+  const skippedError = results.filter(r => r.status === 'skipped_error');
+  const skippedEmpty = results.filter(r => r.status === 'skipped_empty');
   const writeFailed = results.filter(r => r.status === 'write_failed');
   const exceptions = results.filter(r => r.status === 'exception');
 
   console.log('\n📊 Summary:');
   console.log(`  ✅ Successfully updated: ${updated.length}/${results.length} windows`);
-  if (skipped.length > 0) {
-    console.log(`  ⏭️ Skipped (query error): ${skipped.length} windows (previous cache preserved)`);
+  if (skippedError.length > 0) {
+    console.log(`  ⏭️ Skipped (query error): ${skippedError.length} windows (previous cache preserved)`);
+  }
+  if (skippedEmpty.length > 0) {
+    console.log(`  ⏭️ Skipped (empty result): ${skippedEmpty.length} windows (previous cache preserved)`);
   }
   if (writeFailed.length > 0) {
     console.log(`  ❌ Write failed: ${writeFailed.length} windows`);
@@ -643,30 +663,50 @@ async function main() {
         icon = '⏭️';
         detail = 'SKIPPED - query error (previous cache preserved)';
         break;
+      case 'skipped_empty':
+        icon = '⏭️';
+        detail = 'SKIPPED - no movers found (previous cache preserved)';
+        break;
       case 'write_failed':
         icon = '❌';
         detail = 'cache write failed';
         break;
       case 'exception':
         icon = '💥';
-        detail = 'exception occurred';
+        detail = 'exception occurred (previous cache preserved)';
         break;
     }
     console.log(`  ${icon} ${r.window}: ${detail}`);
   }
 
-  // Final status message
+  // Determine exit status
+  // Success: at least one window was updated with actual movers
+  // Failure: no windows were updated (all had errors, exceptions, or empty results)
+  const hasAnySuccess = updated.length > 0;
+  const hasFailures = skippedError.length > 0 || writeFailed.length > 0 || exceptions.length > 0;
+
   if (updated.length === results.length) {
     console.log('\n🎉 All windows updated successfully!');
-  } else if (updated.length > 0) {
+    process.exit(0);
+  } else if (hasAnySuccess) {
     console.log(`\n⚠️ Partial success: ${updated.length}/${results.length} windows updated`);
-  } else if (skipped.length === results.length) {
-    console.log('\n⚠️ All windows skipped due to errors - previous cache data preserved');
+    // Partial success is still exit 0 - we have some good data
+    process.exit(0);
+  } else if (skippedEmpty.length === results.length) {
+    // All windows had no movers - this might be valid (no big moves right now)
+    // But we preserve cache, so exit 0 but with warning
+    console.log('\n⚠️ No movers found in any window - previous cache data preserved');
+    console.log('   This may be normal if there are no significant price movements.');
+    process.exit(0);
+  } else if (hasFailures) {
+    // Had actual failures (errors, exceptions, write failures)
+    console.log('\n❌ FAILURE: No windows were updated successfully due to errors');
+    console.log('   Previous cache data preserved. Check logs above for details.');
+    process.exit(1);
   } else {
     console.log('\n❌ No windows were updated successfully');
+    process.exit(1);
   }
-
-  process.exit(0);
 }
 
 main().catch((error) => {
