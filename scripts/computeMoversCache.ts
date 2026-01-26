@@ -4,14 +4,20 @@
  * Computes movers directly in Node.js by querying price_snapshots table.
  * Does NOT use the get_movers() RPC function (avoids Supabase Free plan timeouts).
  *
+ * Key constraints:
+ * - Queries only last 48 hours of data
+ * - Past snapshot matching: ±30 minute tolerance from target time
+ * - Limit: 10 gainers + 10 losers per window
+ *
  * Algorithm:
  * 1. Fetch latest snapshots (last 3 hours) -> reduce to one per market
- * 2. Fetch past snapshots (window + 6 hours) -> find closest to target_time per market
- * 3. Calculate change_pp, apply filters
- * 4. Enrich with market metadata
- * 5. Apply category exclusion
- * 6. Sort and slice to top 20 gainers/losers
- * 7. Upsert to movers_cache
+ * 2. Fetch past snapshots (capped at 48h) -> find closest to target_time per market
+ * 3. Reject past snapshots outside ±30 min tolerance
+ * 4. Calculate change_pp, apply filters (price range, volume, min change)
+ * 5. Enrich with market metadata
+ * 6. Apply category exclusion
+ * 7. Sort and slice to top 10 gainers/losers
+ * 8. Upsert to movers_cache (only if we have movers, else preserve cache)
  *
  * Run by GitHub Actions every 15 minutes after snapshot ingestion.
  *
@@ -43,9 +49,9 @@ type WindowConfig = {
 };
 
 const WINDOW_CONFIGS: WindowConfig[] = [
-  { window_key: '1h', window_minutes: 60, min_volume_usd: 1000, limit: 20 },
-  { window_key: '6h', window_minutes: 360, min_volume_usd: 5000, limit: 20 },
-  { window_key: '24h', window_minutes: 1440, min_volume_usd: 15000, limit: 20 },
+  { window_key: '1h', window_minutes: 60, min_volume_usd: 1000, limit: 10 },
+  { window_key: '6h', window_minutes: 360, min_volume_usd: 5000, limit: 10 },
+  { window_key: '24h', window_minutes: 1440, min_volume_usd: 15000, limit: 10 },
 ];
 
 // Price range filter: only show markets not "already decided"
@@ -54,6 +60,12 @@ const MAX_PRICE = 0.95;
 
 // Big moves only: at least 10 percentage points
 const MIN_CHANGE_PP = 10;
+
+// Tolerance for past snapshot matching: ±30 minutes
+const PAST_SNAPSHOT_TOLERANCE_MINUTES = 30;
+
+// Maximum data scope: 48 hours (in minutes)
+const MAX_DATA_SCOPE_MINUTES = 48 * 60; // 2880 minutes
 
 // Sports/entertainment keywords to filter out (ONLY specific league/team names)
 const EXCLUDED_KEYWORDS = [
@@ -182,16 +194,19 @@ async function fetchLatestSnapshots(
 /**
  * Fetch past snapshots for finding historical prices
  * Query snapshots within (window_minutes + 360) minutes to have enough data
+ * Capped at MAX_DATA_SCOPE_MINUTES (48 hours) to limit query scope
  */
 async function fetchPastSnapshots(
   supabase: AnySupabaseClient,
   windowMinutes: number
 ): Promise<{ snapshots: Snapshot[]; error: boolean }> {
   // Fetch snapshots from window_minutes + 6 hours ago to have enough range
-  const lookbackMinutes = windowMinutes + 360;
+  // Cap at 48 hours max to avoid querying too much data
+  const rawLookbackMinutes = windowMinutes + 360;
+  const lookbackMinutes = Math.min(rawLookbackMinutes, MAX_DATA_SCOPE_MINUTES);
   const cutoffTime = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
 
-  console.log(`  Fetching past snapshots since ${cutoffTime} (${lookbackMinutes} min lookback)...`);
+  console.log(`  Fetching past snapshots since ${cutoffTime} (${lookbackMinutes} min lookback, capped at ${MAX_DATA_SCOPE_MINUTES} min)...`);
 
   const { data, error } = await supabase
     .from('price_snapshots')
@@ -210,7 +225,8 @@ async function fetchPastSnapshots(
 }
 
 /**
- * Find the past snapshot closest to target_time for each market
+ * Find the past snapshot closest to target_time for each market.
+ * Only accepts snapshots within ±PAST_SNAPSHOT_TOLERANCE_MINUTES of target time.
  */
 function findPastSnapshotsForMarkets(
   latestMap: Map<string, Snapshot>,
@@ -218,6 +234,7 @@ function findPastSnapshotsForMarkets(
   windowMinutes: number
 ): Map<string, Snapshot> {
   const pastMap = new Map<string, Snapshot>();
+  const toleranceMs = PAST_SNAPSHOT_TOLERANCE_MINUTES * 60 * 1000;
 
   // Group past snapshots by market_id
   const pastByMarket = new Map<string, Snapshot[]>();
@@ -226,6 +243,8 @@ function findPastSnapshotsForMarkets(
     existing.push(snap);
     pastByMarket.set(snap.market_id, existing);
   }
+
+  let rejectedByTolerance = 0;
 
   // For each market with a latest snapshot, find the best past snapshot
   for (const [marketId, latestSnap] of Array.from(latestMap.entries())) {
@@ -250,9 +269,17 @@ function findPastSnapshotsForMarkets(
       }
     }
 
-    if (bestSnap) {
+    // Only accept if within ±30 minute tolerance
+    if (bestSnap && bestDiff <= toleranceMs) {
       pastMap.set(marketId, bestSnap);
+    } else if (bestSnap) {
+      // Had a candidate but it was outside tolerance
+      rejectedByTolerance++;
     }
+  }
+
+  if (rejectedByTolerance > 0) {
+    console.log(`  Rejected ${rejectedByTolerance} markets: past snapshot outside ±${PAST_SNAPSHOT_TOLERANCE_MINUTES}min tolerance`);
   }
 
   return pastMap;
