@@ -24,8 +24,24 @@ async function main() {
     console.log(`Filtered (sports): ${result.filteredSportsCount}`);
     console.log(`Kept (total): ${result.keptMarketsTotal}`);
     console.log(`Markets upserted: ${result.marketsUpserted}`);
+    console.log('\n--- Categorization ---');
+    console.log(`Categorized markets: ${result.categorizedMarkets}`);
+    console.log(`Allowed category markets: ${result.allowedCategoryMarkets}`);
+    console.log(`Excluded category markets: ${result.excludedCategoryMarkets}`);
+    console.log('\n--- Snapshots ---');
     console.log(`Snapshots inserted: ${result.snapshotsInserted}`);
+    console.log(`Snapshots skipped (category): ${result.snapshotsSkippedByCategory}`);
+    console.log(`Snapshots skipped (price range): ${result.snapshotsSkippedByPrice}`);
     console.log(`Last snapshot: ${result.lastSnapshotCreatedAt || 'N/A'}`);
+
+    // Show category breakdown
+    if (result.categoryBreakdown && Object.keys(result.categoryBreakdown).length > 0) {
+      console.log('\n--- Category Breakdown ---');
+      const sorted = Object.entries(result.categoryBreakdown).sort((a, b) => b[1] - a[1]);
+      for (const [cat, count] of sorted) {
+        console.log(`  ${cat}: ${count}`);
+      }
+    }
 
     process.exit(0);
   } catch (error) {
