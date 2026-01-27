@@ -195,11 +195,20 @@ async function fetchLatestSnapshots(
  * Fetch past snapshots for finding historical prices
  * Query snapshots within (window_minutes + 360) minutes to have enough data
  * Capped at MAX_DATA_SCOPE_MINUTES (48 hours) to limit query scope
+ * 
+ * OPTIMIZATION: Only fetches snapshots for markets that have a latest snapshot.
+ * This dramatically reduces query size from millions to thousands of rows.
  */
 async function fetchPastSnapshots(
   supabase: AnySupabaseClient,
-  windowMinutes: number
+  windowMinutes: number,
+  marketIds: string[]
 ): Promise<{ snapshots: Snapshot[]; error: boolean }> {
+  if (marketIds.length === 0) {
+    console.log('  No market IDs to fetch past snapshots for');
+    return { snapshots: [], error: false };
+  }
+
   // Fetch snapshots from window_minutes + 6 hours ago to have enough range
   // Cap at 48 hours max to avoid querying too much data
   const rawLookbackMinutes = windowMinutes + 360;
@@ -207,10 +216,12 @@ async function fetchPastSnapshots(
   const cutoffTime = new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString();
 
   console.log(`  Fetching past snapshots since ${cutoffTime} (${lookbackMinutes} min lookback, capped at ${MAX_DATA_SCOPE_MINUTES} min)...`);
+  console.log(`  Filtering by ${marketIds.length} market IDs from latest snapshots`);
 
   const { data, error } = await supabase
     .from('price_snapshots')
     .select('market_id, created_at, yes_price')
+    .in('market_id', marketIds)
     .gt('created_at', cutoffTime)
     .order('created_at', { ascending: false });
 
@@ -220,7 +231,7 @@ async function fetchPastSnapshots(
   }
 
   const rows = (data || []) as Snapshot[];
-  console.log(`  Fetched ${rows.length} past snapshot candidates`);
+  console.log(`  Fetched ${rows.length} past snapshot candidates (filtered by market_id)`);
   return { snapshots: rows, error: false };
 }
 
@@ -350,9 +361,10 @@ async function computeMoversForWindow(
     return { gainers: [], losers: [], stats, error: false };
   }
 
-  // Step 2: Fetch past snapshots
+  // Step 2: Fetch past snapshots (only for markets with latest snapshots)
   console.log('\n[Step 2] Fetching past snapshots...');
-  const { snapshots: pastSnapshots, error: pastError } = await fetchPastSnapshots(supabase, config.window_minutes);
+  const marketIds = Array.from(latestMap.keys());
+  const { snapshots: pastSnapshots, error: pastError } = await fetchPastSnapshots(supabase, config.window_minutes, marketIds);
   if (pastError) {
     return { gainers: [], losers: [], stats: { fetch_past_error: 1 }, error: true };
   }
