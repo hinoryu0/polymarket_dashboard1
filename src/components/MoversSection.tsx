@@ -150,13 +150,9 @@ export default function MoversSection() {
               </div>
             </div>
           ))
-        ) : error ? (
-          <div className="px-4 py-8 text-center text-sm text-red-600">
-            {error}
-          </div>
         ) : data.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-gray-500">
-            Not enough snapshot history for this window yet
+            No significant moves in this window
           </div>
         ) : (
           data.map((mover) => (
@@ -201,11 +197,52 @@ export default function MoversSection() {
         </div>
       </div>
 
+      {/* Error State */}
+      {!loading && error && (
+        <div className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <svg className="w-5 h-5 text-red-600 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+            </svg>
+            <div className="flex-1">
+              <h4 className="text-sm font-semibold text-red-800 mb-1">Failed to load movers</h4>
+              <p className="text-sm text-red-700">{error}</p>
+              <button
+                onClick={fetchMovers}
+                className="mt-3 text-sm font-medium text-red-600 hover:text-red-700 underline"
+              >
+                Try again
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Info State - No significant moves */}
+      {!loading && !error && gainers.length === 0 && losers.length === 0 && (
+        <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <svg className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            </svg>
+            <div className="flex-1">
+              <h4 className="text-sm font-semibold text-blue-800 mb-1">No significant moves detected</h4>
+              <p className="text-sm text-blue-700">
+                There are no markets with large price movements (&gt;10pp) in the {window} window.
+                Try a different time window or check back later.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Movers Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <MoverPanel title="Top Gainers" data={gainers} isGainer={true} />
-        <MoverPanel title="Top Losers" data={losers} isGainer={false} />
-      </div>
+      {!error && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <MoverPanel title="Top Gainers" data={gainers} isGainer={true} />
+          <MoverPanel title="Top Losers" data={losers} isGainer={false} />
+        </div>
+      )}
     </div>
   );
 }
